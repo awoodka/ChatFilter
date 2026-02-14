@@ -1,0 +1,30 @@
+Metadata-Version: 2.4
+Name: chatfilter
+Version: 0.1.0
+Summary: Twitch VOD chat conversion + filtering utilities (JSONL-first).
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+
+## chatfilter (Python)
+
+This package provides:
+- `chatfilter convert`: convert TwitchDownloader chat JSON to canonical JSONL
+- `chatfilter filter`: filter canonical JSONL down to a target keep ratio (default 20%) + metrics
+
+### Install (dev)
+
+From repo root:
+
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -e backend/chatfilter
+```
+
+### Usage
+
+```bash
+chatfilter convert --input data/vods/<vodId>/raw/chat.json --output data/vods/<vodId>/canonical/chat.jsonl --vod-id <vodId> --channel <channel>
+chatfilter filter --input data/vods/<vodId>/canonical/chat.jsonl --output data/vods/<vodId>/runs/<runId>/filtered.jsonl --metrics data/vods/<vodId>/runs/<runId>/metrics.json --target-keep 0.20
+```
+

@@ -1,0 +1,21 @@
+.DS_Store
+.env
+.env.local
+.env.*.local
+
+# data artifacts
+/data/
+
+# python
+__pycache__/
+*.pyc
+.venv/
+.python-version
+.pytest_cache/
+
+# node / next
+node_modules/
+apps/web/node_modules/
+apps/web/.next/
+apps/web/out/
+
