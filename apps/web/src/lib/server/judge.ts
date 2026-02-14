@@ -1,7 +1,7 @@
 type LogFn = (line: string) => Promise<void> | void;
 
 export type JudgeRateLimiter = {
-  waitForSlot: () => Promise<void>;
+  waitForSlot: (signal?: AbortSignal) => Promise<void>;
   onRateLimited: (ms: number) => void;
 };
 
@@ -10,11 +10,12 @@ export function createJudgeRateLimiter(maxRpm: number): JudgeRateLimiter {
   const requestTimes: number[] = [];
   let globalCooldownUntilMs = 0;
   return {
-    async waitForSlot() {
+    async waitForSlot(signal?: AbortSignal) {
       while (true) {
+        throwIfAborted(signal);
         const now = Date.now();
         if (now < globalCooldownUntilMs) {
-          await sleepMs(Math.max(25, globalCooldownUntilMs - now));
+          await sleepMs(Math.max(25, globalCooldownUntilMs - now), signal);
           continue;
         }
         while (requestTimes.length > 0 && requestTimes[0]! <= now - 60_000) requestTimes.shift();
@@ -23,7 +24,7 @@ export function createJudgeRateLimiter(maxRpm: number): JudgeRateLimiter {
           return;
         }
         const waitMs = Math.max(25, 60_000 - (now - requestTimes[0]!) + 5);
-        await sleepMs(waitMs);
+        await sleepMs(waitMs, signal);
       }
     },
     onRateLimited(ms: number) {
@@ -38,10 +39,11 @@ export async function scoreWithRetries(opts: {
   systemPrompt: string;
   userPrompt: string;
   limiter: JudgeRateLimiter;
+  signal?: AbortSignal;
   maxAttempts?: number;
   appendLog?: LogFn;
 }): Promise<{ relevance: number; humor: number; engagement: number; score: number; reason: string }> {
-  const { apiKey, model, systemPrompt, userPrompt, limiter, appendLog } = opts;
+  const { apiKey, model, systemPrompt, userPrompt, limiter, appendLog, signal } = opts;
   const maxAttempts = Math.max(1, Math.floor(opts.maxAttempts ?? 6));
   const url = "https://api.openai.com/v1/chat/completions";
   const payload = {
@@ -57,17 +59,21 @@ export async function scoreWithRetries(opts: {
   let lastErr: unknown = null;
 
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    await limiter.waitForSlot();
+    throwIfAborted(signal);
+    await limiter.waitForSlot(signal);
     try {
+      throwIfAborted(signal);
       resp = await fetch(url, {
         method: "POST",
         headers: {
           Authorization: `Bearer ${apiKey}`,
           "content-type": "application/json",
         },
+        signal,
         body: JSON.stringify(payload),
       });
     } catch (err: unknown) {
+      if (isAbortError(err, signal)) throw abortError();
       lastErr = err;
       resp = null;
     }
@@ -108,6 +114,7 @@ export async function scoreWithRetries(opts: {
         }
         return { relevance, humor, engagement, score, reason };
       } catch (err: unknown) {
+        if (isAbortError(err, signal)) throw abortError();
         // e.g. "terminated" while reading body
         lastErr = err;
         resp = null;
@@ -117,6 +124,7 @@ export async function scoreWithRetries(opts: {
     const status = resp?.status ?? 0;
     const shouldRetry = status === 0 || status === 408 || status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
     if (!shouldRetry) break;
+    throwIfAborted(signal);
 
     const retryAfterMs = resp ? parseRetryAfterMs(resp.headers) : null;
     const jitterMs = Math.floor(Math.random() * 250);
@@ -125,7 +133,7 @@ export async function scoreWithRetries(opts: {
     await appendLog?.(
       `openai retry attempt=${attempt}/${maxAttempts} status=${status} backoff_ms=${backoffMs}${retryAfterMs !== null ? ` retry_after_ms=${retryAfterMs}` : ""} ${lastErr instanceof Error ? `err=${lastErr.message}` : ""}`,
     );
-    await sleepMs(backoffMs);
+    await sleepMs(backoffMs, signal);
   }
 
   const status = resp?.status ?? 0;
@@ -171,8 +179,21 @@ function computeTotalScore(relevance: number, humor: number, engagement: number)
   return Math.round(((relevance + humor + engagement) / 30) * 100);
 }
 
-function sleepMs(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleepMs(ms: number, signal?: AbortSignal): Promise<void> {
+  if (!signal) return new Promise((resolve) => setTimeout(resolve, ms));
+  throwIfAborted(signal);
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      signal.removeEventListener("abort", onAbort);
+      reject(abortError());
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 
 function headerPick(headers: Headers, key: string): string | null {
@@ -201,4 +222,20 @@ function parseRetryAfterMs(headers: Headers): number | null {
     return ms > 0 ? ms : 0;
   }
   return null;
+}
+
+function abortError(): Error {
+  const err = new Error("aborted");
+  err.name = "AbortError";
+  return err;
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) throw abortError();
+}
+
+function isAbortError(err: unknown, signal?: AbortSignal): boolean {
+  if (signal?.aborted) return true;
+  if (!(err instanceof Error)) return false;
+  return err.name === "AbortError" || err.message === "aborted";
 }

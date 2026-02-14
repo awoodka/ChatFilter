@@ -52,6 +52,7 @@ type LiveContextDebugFile = {
 
 type RunnerState = {
   stopRequested: boolean;
+  scoreAbortController: AbortController | null;
 };
 
 const LIVE_RUNNERS = new Map<string, RunnerState>();
@@ -275,6 +276,10 @@ function parsePrivmsg(line: string): { username: string | null; text: string } |
   return { username: m[1] ?? null, text: m[2] ?? "" };
 }
 
+function isAbortError(err: unknown): boolean {
+  return err instanceof Error && (err.name === "AbortError" || err.message === "aborted");
+}
+
 export async function startLiveSession(req: LiveStartRequest): Promise<void> {
   const { sessionId } = req;
   const channel = extractChannel(req.channelOrUrl);
@@ -335,15 +340,30 @@ export async function startLiveSession(req: LiveStartRequest): Promise<void> {
   await writeLiveStatus(status);
   await appendJobLog(sessionId, tsLine(`live session start channel=${channel}`));
 
-  const runner: RunnerState = { stopRequested: false };
+  const scoreAbortController = new AbortController();
+  const runner: RunnerState = { stopRequested: false, scoreAbortController };
   LIVE_RUNNERS.set(sessionId, runner);
 
+  function abortScoring() {
+    if (!scoreAbortController.signal.aborted) scoreAbortController.abort();
+  }
+
   async function shouldStop(): Promise<boolean> {
-    if (runner.stopRequested) return true;
-    if (fsSync.existsSync(stopPath)) return true;
+    if (runner.stopRequested) {
+      abortScoring();
+      return true;
+    }
+    if (fsSync.existsSync(stopPath)) {
+      abortScoring();
+      return true;
+    }
     const s = await readJobStatus(sessionId);
     if (!s) return false;
-    return s.step === "stopping";
+    if (s.step === "stopping") {
+      abortScoring();
+      return true;
+    }
+    return false;
   }
 
   const limiter = createJudgeRateLimiter(Math.max(1, Number(process.env.EVAL_JUDGE_MAX_RPM ?? 120)));
@@ -356,6 +376,7 @@ export async function startLiveSession(req: LiveStartRequest): Promise<void> {
   const recentTranscript: Array<{ ts_ms: number; text: string }> = [];
   const transcriptTail: string[] = [];
   const recentScored: Array<{ ts_ms: number; text: string; score: number; reason: string }> = [];
+  const inFlightScoring = new Set<Promise<void>>();
   const chatterLastSeenMs = new Map<string, number>();
   const counts = {
     seen: 0,
@@ -499,11 +520,13 @@ Remember: use the streamer profile above to judge humor and engagement - what ma
       systemPrompt: cfg.systemPrompt,
       userPrompt,
       limiter,
+      signal: scoreAbortController.signal,
       appendLog: async (line) => {
         if (line.includes("status=429")) counts.retries429 += 1;
         await appendJobLog(sessionId, tsLine(line));
       },
     });
+    if (scoreAbortController.signal.aborted || (await shouldStop())) return;
     counts.scored += 1;
     recentScored.push({
       ts_ms: msg.ts_ms,
@@ -572,7 +595,18 @@ Remember: use the streamer profile above to judge humor and engagement - what ma
         recentChat.push(row);
         if (recentChat.length > 150) recentChat.shift();
         void appendJsonl(chatPath, row);
-        void scoreAndEmit(row);
+        const scorePromise = (async () => {
+          try {
+            await scoreAndEmit(row);
+          } catch (err: unknown) {
+            if (isAbortError(err)) return;
+            await appendJobLog(sessionId, tsLine(`score error: ${err instanceof Error ? err.message : String(err)}`));
+          }
+        })();
+        inFlightScoring.add(scorePromise);
+        void scorePromise.finally(() => {
+          inFlightScoring.delete(scorePromise);
+        });
       })();
     }
   });
@@ -656,6 +690,8 @@ Remember: use the streamer profile above to judge humor and engagement - what ma
       // keep service alive until stop; chat scoring continues on socket callbacks
     }
     socket.destroy();
+    abortScoring();
+    await Promise.allSettled(Array.from(inFlightScoring));
     await flushLatest();
     await maybePersistLiveContext(true);
     const done = await readJobStatus(sessionId);
@@ -669,6 +705,8 @@ Remember: use the streamer profile above to judge humor and engagement - what ma
     await appendJobLog(sessionId, tsLine("live session stopped"));
   } catch (err: unknown) {
     socket.destroy();
+    abortScoring();
+    await Promise.allSettled(Array.from(inFlightScoring));
     await maybePersistLiveContext(true);
     const msg = err instanceof Error ? err.message : String(err);
     const failed = await readJobStatus(sessionId);
@@ -683,13 +721,17 @@ Remember: use the streamer profile above to judge humor and engagement - what ma
     await appendJobLog(sessionId, tsLine(`live session failed: ${msg}`));
   } finally {
     liveFilter.close();
+    runner.scoreAbortController = null;
     LIVE_RUNNERS.delete(sessionId);
   }
 }
 
 export async function requestStopLiveSession(sessionId: string): Promise<boolean> {
   const r = LIVE_RUNNERS.get(sessionId);
-  if (r) r.stopRequested = true;
+  if (r) {
+    r.stopRequested = true;
+    r.scoreAbortController?.abort();
+  }
   try {
     await fs.mkdir(liveSessionDir(sessionId), { recursive: true });
     await fs.writeFile(stopFlagPath(sessionId), "1\n", "utf-8");
