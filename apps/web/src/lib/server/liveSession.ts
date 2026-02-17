@@ -15,10 +15,8 @@ import { dataRootDir } from "@/lib/vod";
 type LiveStartRequest = {
   sessionId: string;
   userId: string;
-  token: string;
   channelOrUrl: string;
   currentGame?: string;
-  audioSourcePath: string;
   thresholdScoreExclusive: number;
   longTermCacheText: string;
   bots: string[];
@@ -56,6 +54,7 @@ type RunnerState = {
 };
 
 const LIVE_RUNNERS = new Map<string, RunnerState>();
+const DEFAULT_TWITCH_WEB_CLIENT_ID = "kimne78kx3ncx6brgo4mv6wki5h1ko";
 
 export function liveRootDir(): string {
   return path.join(dataRootDir(), "live");
@@ -119,6 +118,8 @@ type LiveFilterInput = {
   tags?: Record<string, unknown>;
 };
 
+type LiveTranscribeProvider = "local" | "openai" | "auto";
+
 class PythonLiveFilterClient {
   private readonly proc;
   private readonly pending: Array<{
@@ -129,14 +130,14 @@ class PythonLiveFilterClient {
   private readonly stderrRl;
   private readonly stdoutRl;
 
-  constructor(opts: { env: NodeJS.ProcessEnv; onStderrLine: (line: string) => void; knownEmotes: string[] }) {
+  constructor(opts: { pythonBin: string; env: NodeJS.ProcessEnv; onStderrLine: (line: string) => void; knownEmotes: string[] }) {
     const args = [
       "-m",
       "chatfilter",
       "filter-live-stream",
       ...opts.knownEmotes.slice(0, 200).flatMap((e) => ["--known-emote", e]),
     ];
-    this.proc = spawn("python3", args, {
+    this.proc = spawn(opts.pythonBin, args, {
       env: opts.env,
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -200,6 +201,151 @@ class PythonLiveFilterClient {
   }
 }
 
+class LocalWhisperClient {
+  private readonly proc;
+  private readonly pending: Array<{
+    resolve: (text: string) => void;
+    reject: (err: Error) => void;
+  }> = [];
+  private closed = false;
+  private readonly stderrRl;
+  private readonly stdoutRl;
+  private startupFatal: string | null = null;
+  private stopping = false;
+
+  constructor(opts: {
+    pythonBin: string;
+    model: string;
+    device: string;
+    computeType: string;
+    onStderrLine: (line: string) => void;
+  }) {
+    const py = `
+import base64
+import json
+import sys
+import tempfile
+
+try:
+    from faster_whisper import WhisperModel
+except Exception as e:
+    print(json.dumps({"fatal": f"missing_faster_whisper: {e}"}), flush=True)
+    sys.exit(2)
+
+model_name = sys.argv[1] if len(sys.argv) > 1 else "base"
+device = sys.argv[2] if len(sys.argv) > 2 else "cpu"
+compute_type = sys.argv[3] if len(sys.argv) > 3 else "int8"
+
+try:
+    model = WhisperModel(model_name, device=device, compute_type=compute_type)
+except Exception as e:
+    print(json.dumps({"fatal": f"whisper_model_init_failed: {e}"}), flush=True)
+    sys.exit(3)
+
+for line in sys.stdin:
+    line = line.strip()
+    if not line:
+        continue
+    try:
+        req = json.loads(line)
+    except Exception as e:
+        print(json.dumps({"error": f"bad_request_json: {e}"}), flush=True)
+        continue
+    audio_b64 = req.get("audio_b64")
+    if not isinstance(audio_b64, str) or not audio_b64:
+        print(json.dumps({"error": "missing_audio_b64"}), flush=True)
+        continue
+    try:
+        audio_bytes = base64.b64decode(audio_b64)
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as f:
+            f.write(audio_bytes)
+            f.flush()
+            segments, _ = model.transcribe(f.name, vad_filter=True, beam_size=1)
+        text = " ".join([(seg.text or "").strip() for seg in segments]).strip()
+        print(json.dumps({"text": text}), flush=True)
+    except Exception as e:
+        print(json.dumps({"error": f"transcribe_failed: {e}"}), flush=True)
+`;
+    this.proc = spawn(opts.pythonBin, ["-u", "-c", py, opts.model, opts.device, opts.computeType], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: process.env,
+    });
+    this.stdoutRl = readline.createInterface({ input: this.proc.stdout, crlfDelay: Infinity });
+    this.stderrRl = readline.createInterface({ input: this.proc.stderr, crlfDelay: Infinity });
+
+    this.stdoutRl.on("line", (line) => {
+      let parsed: unknown = null;
+      try {
+        parsed = JSON.parse(line);
+      } catch {
+        // ignore bad stdout line; it'll surface via timeout/exit on requests.
+      }
+      const rec = typeof parsed === "object" && parsed !== null ? (parsed as Record<string, unknown>) : null;
+      const fatal = rec && typeof rec["fatal"] === "string" ? rec["fatal"] : null;
+      if (fatal) {
+        this.startupFatal = fatal;
+      }
+
+      const next = this.pending.shift();
+      if (!next) return;
+      if (fatal) {
+        next.reject(new Error(fatal));
+        return;
+      }
+      if (rec && typeof rec["error"] === "string") {
+        next.reject(new Error(String(rec["error"])));
+        return;
+      }
+      if (rec && typeof rec["text"] === "string") {
+        next.resolve(String(rec["text"]).trim());
+        return;
+      }
+      next.resolve("");
+    });
+
+    this.stderrRl.on("line", opts.onStderrLine);
+    this.proc.on("exit", (code, signal) => {
+      const msg = this.startupFatal
+        ? `local whisper exited: ${this.startupFatal}`
+        : this.stopping
+          ? "local whisper stopped"
+          : `local whisper process exited code=${code ?? "null"} signal=${signal ?? "null"}`;
+      this.closed = true;
+      while (this.pending.length > 0) {
+        this.pending.shift()?.reject(new Error(msg));
+      }
+    });
+  }
+
+  async transcribeWav(wavBuffer: Buffer): Promise<string> {
+    if (this.startupFatal) throw new Error(this.startupFatal);
+    if (this.closed || !this.proc.stdin.writable) throw new Error("Local whisper process is not running");
+    return await new Promise<string>((resolve, reject) => {
+      this.pending.push({ resolve, reject });
+      const line = JSON.stringify({ audio_b64: wavBuffer.toString("base64") }) + "\n";
+      this.proc.stdin.write(line, "utf-8", (err) => {
+        if (!err) return;
+        const next = this.pending.pop();
+        next?.reject(err);
+      });
+    });
+  }
+
+  close(): void {
+    if (this.closed) return;
+    this.stopping = true;
+    this.closed = true;
+    try {
+      this.proc.stdin.end();
+    } catch {
+      // ignore
+    }
+    this.stdoutRl.close();
+    this.stderrRl.close();
+    this.proc.kill();
+  }
+}
+
 async function writeLiveStatus(status: JobStatus): Promise<void> {
   await writeJobStatus(status);
 }
@@ -227,47 +373,168 @@ async function tailJsonl(p: string, limit: number): Promise<Array<Record<string,
   }
 }
 
-async function transcribeChunkFasterWhisper(chunkPath: string): Promise<Array<{ start: number; end: number; text: string }>> {
-  const py = `
-import json
-import sys
+type TwitchPlaybackTokenResponse = {
+  data?: {
+    streamPlaybackAccessToken?: {
+      signature?: string;
+      value?: string;
+    };
+  };
+};
 
-audio_path = sys.argv[1]
-try:
-    from faster_whisper import WhisperModel
-except Exception as e:
-    print(json.dumps({"error": f"missing_faster_whisper: {e}"}))
-    sys.exit(2)
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
 
-model_name = "base"
-model = WhisperModel(model_name, device="cpu", compute_type="int8")
-segments, _info = model.transcribe(audio_path, vad_filter=True, beam_size=1)
-for seg in segments:
-    print(json.dumps({"start": float(seg.start), "end": float(seg.end), "text": str(seg.text or "").strip()}))
-`;
-  const res = await runCommand("python3", ["-c", py, chunkPath], {});
-  if (res.code !== 0) {
-    throw new Error(`faster-whisper failed: ${res.stderr || res.stdout}`);
+function wrapPcmS16leToWav(pcm: Buffer, sampleRate: number, channels: number): Buffer {
+  const bitsPerSample = 16;
+  const blockAlign = channels * (bitsPerSample / 8);
+  const byteRate = sampleRate * blockAlign;
+  const dataSize = pcm.length;
+  const header = Buffer.alloc(44);
+  header.write("RIFF", 0, "ascii");
+  header.writeUInt32LE(36 + dataSize, 4);
+  header.write("WAVE", 8, "ascii");
+  header.write("fmt ", 12, "ascii");
+  header.writeUInt32LE(16, 16);
+  header.writeUInt16LE(1, 20);
+  header.writeUInt16LE(channels, 22);
+  header.writeUInt32LE(sampleRate, 24);
+  header.writeUInt32LE(byteRate, 28);
+  header.writeUInt16LE(blockAlign, 32);
+  header.writeUInt16LE(bitsPerSample, 34);
+  header.write("data", 36, "ascii");
+  header.writeUInt32LE(dataSize, 40);
+  return Buffer.concat([header, pcm], 44 + dataSize);
+}
+
+async function resolveTwitchHlsMasterPlaylist(channel: string): Promise<string> {
+  const twitchClientId = String(process.env.TWITCH_CLIENT_ID ?? "").trim() || DEFAULT_TWITCH_WEB_CLIENT_ID;
+  const oauth = String(process.env.TWITCH_OAUTH_TOKEN ?? "").trim();
+  const headers: Record<string, string> = {
+    "Client-ID": twitchClientId,
+    "Content-Type": "application/json",
+  };
+  if (oauth) headers["Authorization"] = `OAuth ${oauth}`;
+
+  const gqlBody = {
+    operationName: "PlaybackAccessToken_Template",
+    query:
+      "query PlaybackAccessToken_Template($login: String!, $isLive: Boolean!, $vodID: ID!, $isVod: Boolean!, $playerType: String!) { streamPlaybackAccessToken(channelName: $login, params: {platform: \"web\", playerBackend: \"mediaplayer\", playerType: $playerType}) @include(if: $isLive) { value signature __typename } videoPlaybackAccessToken(id: $vodID, params: {platform: \"web\", playerBackend: \"mediaplayer\", playerType: $playerType}) @include(if: $isVod) { value signature __typename } }",
+    variables: {
+      isLive: true,
+      login: channel,
+      isVod: false,
+      vodID: "",
+      playerType: "site",
+    },
+  };
+
+  const res = await fetch("https://gql.twitch.tv/gql", {
+    method: "POST",
+    headers,
+    body: JSON.stringify(gqlBody),
+  });
+  if (!res.ok) {
+    throw new Error(`twitch gql token request failed status=${res.status}`);
   }
-  const out: Array<{ start: number; end: number; text: string }> = [];
-  for (const line of res.stdout.split("\n").filter(Boolean)) {
-    let obj: unknown;
+  const json = (await res.json()) as TwitchPlaybackTokenResponse;
+  const token = json.data?.streamPlaybackAccessToken?.value;
+  const sig = json.data?.streamPlaybackAccessToken?.signature;
+  if (!token || !sig) {
+    throw new Error("twitch playback token missing; stream may be offline or require auth");
+  }
+
+  const params = new URLSearchParams({
+    allow_source: "true",
+    allow_audio_only: "true",
+    fast_bread: "true",
+    player_backend: "mediaplayer",
+    playlist_include_framerate: "true",
+    reassignments_supported: "true",
+    supported_codecs: "av1,h264",
+    sig,
+    token,
+    p: String(Math.floor(Math.random() * 1_000_000)),
+  });
+  return `https://usher.ttvnw.net/api/channel/hls/${encodeURIComponent(channel)}.m3u8?${params.toString()}`;
+}
+
+async function resolveTwitchHlsViaStreamlink(channel: string): Promise<string | null> {
+  const streamlinkCmd = String(process.env.STREAMLINK_PATH ?? "streamlink").trim() || "streamlink";
+  const out = await runCommand(streamlinkCmd, ["--stream-url", `https://www.twitch.tv/${channel}`, "best"], {});
+  if (out.code !== 0) return null;
+  const url = out.stdout
+    .split("\n")
+    .map((x) => x.trim())
+    .find((x) => /^https?:\/\//i.test(x));
+  return url || null;
+}
+
+async function resolveLiveAudioHlsUrl(channel: string): Promise<string> {
+  try {
+    return await resolveTwitchHlsMasterPlaylist(channel);
+  } catch (primaryErr: unknown) {
+    const fallback = await resolveTwitchHlsViaStreamlink(channel);
+    if (fallback) return fallback;
+    throw new Error(
+      `failed to resolve twitch hls for ${channel}: ${
+        primaryErr instanceof Error ? primaryErr.message : String(primaryErr)
+      }`,
+    );
+  }
+}
+
+async function transcribeChunkWithOpenAiWhisper(wavBuffer: Buffer): Promise<string> {
+  const apiKey = String(process.env.OPENAI_API_KEY ?? "").trim();
+  if (!apiKey) throw new Error("Missing OPENAI_API_KEY env var");
+  const model = String(process.env.OPENAI_TRANSCRIBE_MODEL ?? "whisper-1").trim() || "whisper-1";
+
+  let attempt = 0;
+  while (attempt < 4) {
+    attempt += 1;
+    const form = new FormData();
+    form.set("model", model);
+    form.set("response_format", "json");
+    form.set("file", new Blob([new Uint8Array(wavBuffer)], { type: "audio/wav" }), `live_chunk_${Date.now()}.wav`);
+
     try {
-      obj = JSON.parse(line);
-    } catch {
-      continue;
+      const res = await fetch("https://api.openai.com/v1/audio/transcriptions", {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+        },
+        body: form,
+      });
+      if (!res.ok) {
+        const text = await res.text();
+        const retryable = res.status >= 500 || res.status === 429;
+        if (retryable && attempt < 4) {
+          await sleep(300 * 2 ** (attempt - 1));
+          continue;
+        }
+        throw new Error(`openai transcription failed status=${res.status} body=${truncateLine(text, 220)}`);
+      }
+      const json = (await res.json()) as unknown;
+      if (typeof json === "object" && json !== null && typeof (json as Record<string, unknown>)["text"] === "string") {
+        return String((json as Record<string, unknown>)["text"]).trim();
+      }
+      return "";
+    } catch (err: unknown) {
+      if (attempt >= 4) throw err instanceof Error ? err : new Error(String(err));
+      await sleep(300 * 2 ** (attempt - 1));
     }
-    if (typeof obj !== "object" || obj === null) continue;
-    const rec = obj as Record<string, unknown>;
-    if (typeof rec["error"] === "string") throw new Error(rec["error"]);
-    const start = rec["start"];
-    const end = rec["end"];
-    const text = rec["text"];
-    if (typeof start !== "number" || typeof end !== "number" || typeof text !== "string") continue;
-    if (!text.trim()) continue;
-    out.push({ start, end, text: text.trim() });
   }
-  return out;
+  return "";
+}
+
+function resolveTranscribeProvider(): LiveTranscribeProvider {
+  const raw = String(process.env.LIVE_TRANSCRIBE_PROVIDER ?? "local")
+    .trim()
+    .toLowerCase();
+  if (raw === "openai") return "openai";
+  if (raw === "auto") return "auto";
+  return "local";
 }
 
 function parsePrivmsg(line: string): { username: string | null; text: string } | null {
@@ -291,18 +558,59 @@ export async function startLiveSession(req: LiveStartRequest): Promise<void> {
   if (!apiKey) throw new Error("Missing OPENAI_API_KEY env var");
   const apiKeyRequired: string = apiKey;
   const repoRoot = path.join(process.cwd(), "..", "..");
+  const venvPython = path.join(repoRoot, ".venv", "bin", "python");
+  const pythonBin =
+    String(process.env.LIVE_PYTHON_BIN ?? process.env.PYTHON_BIN ?? "").trim() ||
+    (fsSync.existsSync(venvPython) ? venvPython : "python3");
+  const ffmpegEnv = String(process.env.LIVE_FFMPEG_PATH ?? process.env.FFMPEG_PATH ?? "").trim();
+  const bundledFfmpeg = path.join(repoRoot, "tools", "ffmpeg", "ffmpeg");
+  const ffmpegCmd = ffmpegEnv || (fsSync.existsSync(bundledFfmpeg) ? bundledFfmpeg : "ffmpeg");
   const pythonPath = path.join(repoRoot, "backend", "chatfilter", "src");
   const pyEnv = {
     ...process.env,
     PYTHONPATH: process.env.PYTHONPATH ? `${pythonPath}:${process.env.PYTHONPATH}` : pythonPath,
   };
   const liveFilter = new PythonLiveFilterClient({
+    pythonBin,
     env: pyEnv,
     knownEmotes: req.emotes,
     onStderrLine: (line) => {
       void appendJobLog(sessionId, tsLine(`live-filter stderr: ${line}`));
     },
   });
+  const transcribeProvider = resolveTranscribeProvider();
+  const localWhisperModel = String(process.env.LIVE_LOCAL_WHISPER_MODEL ?? "base").trim() || "base";
+  const localWhisperDevice = String(process.env.LIVE_LOCAL_WHISPER_DEVICE ?? "cpu").trim() || "cpu";
+  const localWhisperComputeType = String(process.env.LIVE_LOCAL_WHISPER_COMPUTE_TYPE ?? "int8").trim() || "int8";
+  let localWhisper: LocalWhisperClient | null = null;
+  if (transcribeProvider === "local" || transcribeProvider === "auto") {
+    localWhisper = new LocalWhisperClient({
+      pythonBin,
+      model: localWhisperModel,
+      device: localWhisperDevice,
+      computeType: localWhisperComputeType,
+      onStderrLine: (line) => {
+        void appendJobLog(sessionId, tsLine(`local-whisper stderr: ${line}`));
+      },
+    });
+  }
+  let localWhisperDisabled = false;
+  const transcribeAudioChunk = async (wavBuffer: Buffer): Promise<string> => {
+    if (transcribeProvider === "openai") {
+      return await transcribeChunkWithOpenAiWhisper(wavBuffer);
+    }
+    if (localWhisper && !localWhisperDisabled) {
+      try {
+        return await localWhisper.transcribeWav(wavBuffer);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        if (transcribeProvider === "local") throw new Error(`local whisper failed: ${msg}`);
+        localWhisperDisabled = true;
+        await appendJobLog(sessionId, tsLine(`local whisper disabled after error; falling back to OpenAI: ${truncateLine(msg, 200)}`));
+      }
+    }
+    return await transcribeChunkWithOpenAiWhisper(wavBuffer);
+  };
 
   const sessionDir = liveSessionDir(sessionId);
   await fs.mkdir(sessionDir, { recursive: true });
@@ -332,13 +640,26 @@ export async function startLiveSession(req: LiveStartRequest): Promise<void> {
     meta: {
       userId: req.userId,
       thresholdScoreExclusive: threshold,
-      audioSourcePath: req.audioSourcePath,
+      hlsChannel: channel,
+      transcribeProvider,
       currentGame: String(req.currentGame ?? "").trim(),
       model: cfg.model,
     },
   };
   await writeLiveStatus(status);
   await appendJobLog(sessionId, tsLine(`live session start channel=${channel}`));
+  await appendJobLog(sessionId, tsLine(`python runtime=${pythonBin}`));
+  await appendJobLog(
+    sessionId,
+    tsLine(
+      transcribeProvider === "openai"
+        ? "transcription provider=openai"
+        : `transcription provider=${transcribeProvider} local_model=${localWhisperModel} device=${localWhisperDevice} compute_type=${localWhisperComputeType}`,
+    ),
+  );
+  await appendJobLog(sessionId, tsLine("resolving twitch live hls playlist"));
+  const hlsAudioUrl = await resolveLiveAudioHlsUrl(channel);
+  await appendJobLog(sessionId, tsLine(`resolved hls playlist ${truncateLine(hlsAudioUrl, 180)}`));
 
   const scoreAbortController = new AbortController();
   const runner: RunnerState = { stopRequested: false, scoreAbortController };
@@ -555,8 +876,8 @@ Remember: use the streamer profile above to judge humor and engagement - what ma
   // Twitch IRC client (simple)
   const socket = new net.Socket();
   socket.setEncoding("utf8");
-  const nick = (process.env.TWITCH_IRC_NICK ?? `justinfan${Math.floor(Math.random() * 100000)}`).toLowerCase();
-  const pass = req.token.trim() ? `PASS ${req.token.trim()}` : "PASS SCHMOOPIIE";
+  const nick = `justinfan${Math.floor(Math.random() * 100000)}`.toLowerCase();
+  const pass = "PASS SCHMOOPIIE";
 
   let ircBuffer = "";
   socket.on("data", (chunk: string) => {
@@ -623,57 +944,155 @@ Remember: use the streamer profile above to judge humor and engagement - what ma
     void appendJobLog(sessionId, tsLine(`irc connected nick=${nick} channel=${channel}`));
   });
 
-  // Manual audio-source pseudo-live transcription loop
-  let audioOffsetSec = 0;
-  const chunkSec = 12;
-  const chunkDir = livePath(sessionId, "chunks");
-  await fs.mkdir(chunkDir, { recursive: true });
+  // Server-side Twitch HLS -> ffmpeg PCM stream -> chunked Whisper transcription.
+  const sampleRate = 16_000;
+  const chunkSec = Math.max(2, Number(process.env.LIVE_TRANSCRIBE_CHUNK_SECONDS ?? 3));
+  const bytesPerSecond = sampleRate * 2;
+  const chunkBytes = chunkSec * bytesPerSecond;
+  const maxPendingChunks = Math.max(2, Number(process.env.LIVE_TRANSCRIBE_MAX_PENDING_CHUNKS ?? 4));
   async function transcribeLoop() {
+    let chunkIndex = 0;
+    let consecutiveStreamFailures = 0;
+
     while (!(await shouldStop())) {
-      const chunkPath = path.join(chunkDir, `chunk_${String(audioOffsetSec).padStart(6, "0")}.wav`);
-      const ff = await runCommand("ffmpeg", [
-        "-v",
+      const ffArgs = [
+        "-hide_banner",
+        "-loglevel",
         "error",
-        "-ss",
-        String(audioOffsetSec),
-        "-t",
-        String(chunkSec),
         "-i",
-        req.audioSourcePath,
+        hlsAudioUrl,
+        "-vn",
         "-ac",
         "1",
         "-ar",
-        "16000",
-        "-y",
-        chunkPath,
-      ]);
-      if (ff.code !== 0 || !fsSync.existsSync(chunkPath)) {
-        await appendJobLog(sessionId, tsLine(`audio chunk extraction ended/failed at offset=${audioOffsetSec}s`));
-        break;
-      }
-      const st = await fs.stat(chunkPath);
-      if (st.size < 1024) {
-        await appendJobLog(sessionId, tsLine(`audio chunk too small at offset=${audioOffsetSec}s; stopping transcription loop`));
-        break;
-      }
-      try {
-        const segs = await transcribeChunkFasterWhisper(chunkPath);
-        for (const seg of segs) {
-          const ts_ms = Math.floor((audioOffsetSec + seg.start) * 1000);
-          const row = { ts_ms, start_sec: seg.start, end_sec: seg.end, text: seg.text };
-          await appendJsonl(transcriptPath, row);
-          recentTranscript.push({ ts_ms, text: seg.text });
-          transcriptTail.push(seg.text);
-          if (recentTranscript.length > 300) recentTranscript.shift();
-          if (transcriptTail.length > 30) transcriptTail.shift();
+        String(sampleRate),
+        "-f",
+        "s16le",
+        "pipe:1",
+      ];
+      const ffProc = spawn(ffmpegCmd, ffArgs, { stdio: ["ignore", "pipe", "pipe"] });
+      const ffErrLines: string[] = [];
+      ffProc.on("error", (err) => {
+        ffErrLines.push(`spawn error: ${err.message}`);
+        if (ffErrLines.length > 8) ffErrLines.shift();
+      });
+      const ffErrRl = readline.createInterface({ input: ffProc.stderr, crlfDelay: Infinity });
+      ffErrRl.on("line", (line) => {
+        if (!line) return;
+        ffErrLines.push(line);
+        if (ffErrLines.length > 8) ffErrLines.shift();
+      });
+
+      let pcmRemainder = Buffer.alloc(0);
+      const pendingPcmChunks: Buffer[] = [];
+      let droppedChunks = 0;
+      let workerRunning = false;
+      let ffClosed = false;
+      let ffCloseCode: number | null = null;
+      let ffCloseSignal: NodeJS.Signals | null = null;
+
+      const processPending = async () => {
+        if (workerRunning) return;
+        workerRunning = true;
+        try {
+          while (pendingPcmChunks.length > 0 && !(await shouldStop())) {
+            const pcm = pendingPcmChunks.shift();
+            if (!pcm) continue;
+            const chunkSeq = chunkIndex;
+            chunkIndex += 1;
+            const wavBuffer = wrapPcmS16leToWav(pcm, sampleRate, 1);
+            let text = "";
+            try {
+              text = await transcribeAudioChunk(wavBuffer);
+            } catch (err: unknown) {
+              const errMsg = err instanceof Error ? err.message : String(err);
+              if ((await shouldStop()) || errMsg === "local whisper stopped") {
+                break;
+              }
+              await appendJobLog(
+                sessionId,
+                tsLine(`whisper transcription error: ${errMsg}`),
+              );
+              continue;
+            }
+            const clean = text.trim();
+            if (!clean) continue;
+            const startSec = chunkSeq * chunkSec;
+            const ts_ms = Date.now();
+            const row = { ts_ms, start_sec: startSec, end_sec: startSec + chunkSec, text: clean };
+            await appendJsonl(transcriptPath, row);
+            recentTranscript.push({ ts_ms, text: clean });
+            transcriptTail.push(clean);
+            if (recentTranscript.length > 300) recentTranscript.shift();
+            if (transcriptTail.length > 30) transcriptTail.shift();
+            await maybePersistLiveContext(true);
+          }
+        } finally {
+          workerRunning = false;
         }
-      } catch (err: unknown) {
-        await appendJobLog(sessionId, tsLine(`faster-whisper error: ${err instanceof Error ? err.message : String(err)}`));
+      };
+
+      ffProc.stdout.on("data", (chunk: Buffer) => {
+        if (ffClosed) return;
+        pcmRemainder = Buffer.concat([pcmRemainder, chunk]);
+        while (pcmRemainder.length >= chunkBytes) {
+          const pcmChunk = Buffer.from(pcmRemainder.subarray(0, chunkBytes));
+          pcmRemainder = Buffer.from(pcmRemainder.subarray(chunkBytes));
+          if (pendingPcmChunks.length >= maxPendingChunks) {
+            pendingPcmChunks.shift();
+            droppedChunks += 1;
+            if (droppedChunks === 1 || droppedChunks % 5 === 0) {
+              void appendJobLog(
+                sessionId,
+                tsLine(`transcription backlog detected; dropped chunks=${droppedChunks}`),
+              );
+            }
+          }
+          pendingPcmChunks.push(pcmChunk);
+          void processPending();
+        }
+      });
+
+      const closePromise = new Promise<void>((resolve) => {
+        ffProc.on("close", (code, signal) => {
+          ffClosed = true;
+          ffCloseCode = code;
+          ffCloseSignal = signal;
+          resolve();
+        });
+      });
+
+      while (!(await shouldStop()) && !ffClosed) {
+        await flushLatest();
+        await maybePersistLiveContext(false);
+        await sleep(1200);
       }
-      audioOffsetSec += chunkSec;
-      await flushLatest();
-      await maybePersistLiveContext(false);
-      await new Promise((r) => setTimeout(r, 1000));
+
+      if (await shouldStop()) {
+        try {
+          ffProc.kill("SIGTERM");
+        } catch {
+          // ignore
+        }
+      }
+
+      await closePromise;
+      ffErrRl.close();
+      await processPending();
+
+      if (await shouldStop()) break;
+
+      consecutiveStreamFailures += 1;
+      const errTail = ffErrLines.length ? ` stderr=${truncateLine(ffErrLines.join(" | "), 220)}` : "";
+      await appendJobLog(
+        sessionId,
+        tsLine(`ffmpeg live audio stream ended code=${ffCloseCode ?? "null"} signal=${ffCloseSignal ?? "null"}${errTail}`),
+      );
+      if (consecutiveStreamFailures >= 6) {
+        throw new Error("ffmpeg live stream repeatedly exited; stopping transcription");
+      }
+      await sleep(Math.min(5000, 800 * consecutiveStreamFailures));
+      await appendJobLog(sessionId, tsLine("restarting ffmpeg live audio stream"));
     }
   }
 
@@ -721,6 +1140,7 @@ Remember: use the streamer profile above to judge humor and engagement - what ma
     await appendJobLog(sessionId, tsLine(`live session failed: ${msg}`));
   } finally {
     liveFilter.close();
+    localWhisper?.close();
     runner.scoreAbortController = null;
     LIVE_RUNNERS.delete(sessionId);
   }

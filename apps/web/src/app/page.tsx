@@ -1,66 +1,13 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useState } from "react";
-
-function isRecord(x: unknown): x is Record<string, unknown> {
-  return typeof x === "object" && x !== null;
-}
 
 export default function Home() {
-  const [username, setUsername] = useState<string | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
-      try {
-        const r = await fetch("/api/auth/session", { cache: "no-store" });
-        const j = (await r.json()) as unknown;
-        if (!isRecord(j) || j["ok"] !== true || j["authenticated"] !== true || !isRecord(j["user"])) return;
-        const u = j["user"];
-        if (!cancelled && typeof u["username"] === "string") setUsername(u["username"]);
-      } catch {
-        // no-op
-      }
-    })();
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
   return (
     <div className="twitch-page">
       <div className="twitch-shell max-w-5xl">
         <div className="flex items-baseline justify-between gap-4">
           <h1 className="text-2xl font-semibold tracking-tight">ChatFilter</h1>
-          <div className="flex items-center gap-2">
-            <div className="twitch-pill">Realtime chat highlight tooling</div>
-            {username ? (
-              <div className="flex items-center gap-2">
-                <Link href="/settings" className="twitch-button-secondary !h-8 !text-xs inline-flex items-center">
-                  Settings
-                </Link>
-                <button
-                  className="twitch-button-secondary !h-8 !text-xs"
-                  onClick={async () => {
-                    await fetch("/api/auth/logout", { method: "POST" });
-                    window.location.reload();
-                  }}
-                >
-                  Logout {username}
-                </button>
-              </div>
-            ) : (
-              <>
-                <Link href="/login" className="twitch-link text-sm">
-                  Login
-                </Link>
-                <Link href="/signup" className="twitch-link text-sm">
-                  Sign up
-                </Link>
-              </>
-            )}
-          </div>
         </div>
 
         <div className="mt-3 text-sm twitch-muted">

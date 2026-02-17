@@ -1,50 +1,23 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useSearchParams } from "next/navigation";
+import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  LiveFeedMessage,
+  LiveStatus,
+  loadLiveSnapshot,
+  saveLiveSnapshotPatch,
+  toLiveFeedMessage,
+} from "@/lib/live/sessionSnapshot";
 
 function isRecord(x: unknown): x is Record<string, unknown> {
   return typeof x === "object" && x !== null;
 }
 
-type LiveStatus = {
-  jobId: string;
-  type?: string;
-  state: "queued" | "running" | "succeeded" | "failed";
-  step?: string;
-  error?: string;
-  meta?: Record<string, unknown>;
-};
-
-type LiveFeedMessage = {
-  ts_ms: number;
-  text: string;
-  username: string | null;
-  score: number | null;
-  reason: string | null;
-  relevance?: number | null;
-  humor?: number | null;
-  engagement?: number | null;
-};
-
-function toLiveFeedMessage(x: unknown): LiveFeedMessage | null {
-  if (!isRecord(x)) return null;
-  const ts_ms = x["ts_ms"];
-  const text = x["text"];
-  if (typeof ts_ms !== "number" || typeof text !== "string") return null;
-  const username = typeof x["username"] === "string" ? x["username"] : null;
-  const score = typeof x["score"] === "number" ? x["score"] : null;
-  const reason = typeof x["reason"] === "string" ? x["reason"] : null;
-  const relevance = typeof x["relevance"] === "number" ? x["relevance"] : null;
-  const humor = typeof x["humor"] === "number" ? x["humor"] : null;
-  const engagement = typeof x["engagement"] === "number" ? x["engagement"] : null;
-  return { ts_ms, text, username, score, reason, relevance, humor, engagement };
-}
-
 export default function LivePage() {
-  const [useAnonymousIrc, setUseAnonymousIrc] = useState(true);
-  const [token, setToken] = useState("");
-  const [channelOrUrl, setChannelOrUrl] = useState("");
+  const searchParams = useSearchParams();
+  const [linkedChannelUrl, setLinkedChannelUrl] = useState("");
   const [currentGame, setCurrentGame] = useState("");
   const [threshold, setThreshold] = useState(80);
 
@@ -57,14 +30,13 @@ export default function LivePage() {
   const [errorText, setErrorText] = useState<string | null>(null);
   const [metricsText, setMetricsText] = useState<string>("{ }");
   const [contextText, setContextText] = useState<string>("{ }");
+  const [hasRestoredSnapshot, setHasRestoredSnapshot] = useState(false);
   const goodChatRef = useRef<HTMLDivElement | null>(null);
   const incomingChatRef = useRef<HTMLDivElement | null>(null);
   const logsRef = useRef<HTMLPreElement | null>(null);
+  const pollRef = useRef<(sid: string) => Promise<void>>(async () => {});
 
-  const canStart = useMemo(() => {
-    const hasAuth = useAnonymousIrc || Boolean(token.trim());
-    return hasAuth && Boolean(channelOrUrl.trim());
-  }, [useAnonymousIrc, token, channelOrUrl]);
+  const canStart = Boolean(linkedChannelUrl.trim());
 
   useEffect(() => {
     let cancelled = false;
@@ -75,8 +47,10 @@ export default function LivePage() {
         if (!isRecord(j) || j["ok"] !== true || !isRecord(j["profile"])) return;
         const profile = j["profile"];
         if (cancelled) return;
-        if (typeof profile["twitchChannelUrl"] === "string" && profile["twitchChannelUrl"].trim() && !channelOrUrl.trim()) {
-          setChannelOrUrl(profile["twitchChannelUrl"]);
+        if (typeof profile["twitchChannelUrl"] === "string" && profile["twitchChannelUrl"].trim()) {
+          setLinkedChannelUrl(profile["twitchChannelUrl"]);
+        } else {
+          setLinkedChannelUrl("");
         }
       } catch {
         // ignore
@@ -85,11 +59,9 @@ export default function LivePage() {
     return () => {
       cancelled = true;
     };
-    // Load linked twitch once on mount.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const poll = async (sid: string) => {
+  const poll = useCallback(async (sid: string) => {
     try {
       const r = await fetch(`/api/live/${sid}`, { cache: "no-store" });
       const j = (await r.json()) as unknown;
@@ -114,7 +86,8 @@ export default function LivePage() {
         // ignore context panel failures; live poll should continue
       }
       if (s.state === "running" || s.state === "queued") {
-        setTimeout(() => void poll(sid), 1200);
+        setIsRunning(true);
+        setTimeout(() => void pollRef.current(sid), 1200);
       } else {
         setIsRunning(false);
       }
@@ -122,7 +95,74 @@ export default function LivePage() {
       setErrorText(err instanceof Error ? err.message : String(err));
       setIsRunning(false);
     }
-  };
+  }, []);
+
+  useEffect(() => {
+    pollRef.current = poll;
+  }, [poll]);
+
+  useEffect(() => {
+    const snap = loadLiveSnapshot();
+    const sidFromQuery = String(searchParams.get("sessionId") ?? "").trim();
+    const timer = window.setTimeout(() => {
+      if (snap) {
+        setLinkedChannelUrl(snap.linkedChannelUrl);
+        setCurrentGame(snap.currentGame);
+        setThreshold(snap.threshold);
+        setSessionId(snap.sessionId);
+        setStatus(snap.status);
+        setIsRunning(snap.isRunning);
+        setLogText(snap.logText);
+        setChatMessages(snap.chatMessages);
+        setGoodMessages(snap.goodMessages);
+        setErrorText(snap.errorText);
+        setMetricsText(snap.metricsText);
+        setContextText(snap.contextText);
+      }
+      const sid = sidFromQuery || snap?.sessionId || "";
+      if (sid) {
+        setSessionId(sid);
+        setIsRunning(true);
+        setTimeout(() => void poll(sid), 150);
+      }
+      setHasRestoredSnapshot(true);
+    }, 0);
+    return () => {
+      window.clearTimeout(timer);
+    };
+  }, [poll, searchParams]);
+
+  useEffect(() => {
+    if (!hasRestoredSnapshot) return;
+    saveLiveSnapshotPatch({
+      linkedChannelUrl,
+      currentGame,
+      threshold,
+      sessionId,
+      status,
+      isRunning,
+      logText,
+      chatMessages,
+      goodMessages,
+      errorText,
+      metricsText,
+      contextText,
+    });
+  }, [
+    linkedChannelUrl,
+    currentGame,
+    threshold,
+    sessionId,
+    status,
+    isRunning,
+    logText,
+    chatMessages,
+    goodMessages,
+    errorText,
+    metricsText,
+    contextText,
+    hasRestoredSnapshot,
+  ]);
 
   useEffect(() => {
     if (goodChatRef.current) {
@@ -151,60 +191,15 @@ export default function LivePage() {
             <Link className="twitch-link text-sm" href="/">
               Back
             </Link>
-            <Link className="twitch-link text-sm" href="/eval">
-              Testing dashboard
-            </Link>
           </div>
         </div>
 
         <div className="twitch-card mt-6 p-5">
           <h2 className="text-base font-medium">Start live session</h2>
-          <div className="mt-2 flex items-center gap-2 text-sm">
-            <input
-              id="useAnonymousIrc"
-              type="checkbox"
-              checked={useAnonymousIrc}
-              onChange={(e) => setUseAnonymousIrc(e.target.checked)}
-              className="h-4 w-4"
-            />
-            <label htmlFor="useAnonymousIrc" className="twitch-muted">
-              Use anonymous IRC login (recommended for quick stream chat viewing)
-            </label>
+          <div className="twitch-muted mt-2 text-xs">
+            IRC login is locked to anonymous mode for this MVP.
           </div>
-          <div className="mt-3 grid gap-3 sm:grid-cols-2">
-            <div>
-              <label className="twitch-muted text-xs font-medium">Twitch IRC OAuth token (optional)</label>
-              <input
-                value={token}
-                onChange={(e) => setToken(e.target.value)}
-                placeholder="oauth:xxxxxxxxxxxxxxxx"
-                disabled={useAnonymousIrc}
-                className="twitch-input mt-1"
-              />
-              <div className="twitch-muted mt-1 text-[11px]">
-                {useAnonymousIrc ? "Anonymous mode uses PASS SCHMOOPIIE + justinfan nick." : "Token will be used for authenticated IRC login."}
-              </div>
-            </div>
-            <div>
-              <label className="twitch-muted text-xs font-medium">Channel or stream URL</label>
-              <input
-                value={channelOrUrl}
-                onChange={(e) => setChannelOrUrl(e.target.value)}
-                placeholder="ludwig or https://www.twitch.tv/ludwig"
-                className="twitch-input mt-1"
-              />
-            </div>
-            <div>
-              <label className="twitch-muted text-xs font-medium">Highlight threshold</label>
-              <input
-                type="number"
-                value={threshold}
-                min={0}
-                max={100}
-                onChange={(e) => setThreshold(Math.max(0, Math.min(100, Number(e.target.value || "80"))))}
-                className="twitch-input mt-1"
-              />
-            </div>
+          <div className="mt-3 grid gap-3 sm:grid-cols-2 sm:items-end">
             <div>
               <label className="twitch-muted text-xs font-medium">Current game (context hint)</label>
               <input
@@ -214,59 +209,93 @@ export default function LivePage() {
                 className="twitch-input mt-1"
               />
             </div>
+            <div>
+              <div className="flex items-center justify-between">
+                <label className="twitch-muted text-xs font-medium">Highlight threshold</label>
+                <span className="twitch-muted text-xs">{threshold}</span>
+              </div>
+              <div className="mt-1 flex h-10 items-center">
+                <input
+                  type="range"
+                  value={threshold}
+                  min={0}
+                  max={100}
+                  step={1}
+                  onChange={(e) => setThreshold(Math.max(0, Math.min(100, Number(e.target.value || "80"))))}
+                  className="twitch-slider"
+                />
+              </div>
+            </div>
           </div>
+          <div className="twitch-muted mt-2 text-[11px]">
+            Stream channel is loaded from your profile settings:{" "}
+            {linkedChannelUrl ? <span className="font-medium text-zinc-200">{linkedChannelUrl}</span> : "(not configured)"}
+          </div>
+          {!linkedChannelUrl ? (
+            <div className="mt-2 text-xs">
+              <Link className="twitch-link" href="/settings/profile">
+                Set your Twitch channel in Settings
+              </Link>
+            </div>
+          ) : null}
 
           <div className="twitch-muted mt-3 text-xs">
-            MVP uses local faster-whisper transcription from a server-configured local audio source path, plus Twitch IRC for live chat.
+            MVP captures stream audio server-side from Twitch HLS, then chunks and transcribes with Whisper.
           </div>
 
-          <div className="mt-4 flex flex-wrap gap-2">
-            <button
-              className="twitch-button-primary"
-              disabled={isRunning || !canStart}
-              onClick={async () => {
-                setErrorText(null);
-                setIsRunning(true);
-                setLogText("Starting live session...");
-                const r = await fetch("/api/live/start", {
-                  method: "POST",
-                  headers: { "content-type": "application/json" },
-                  body: JSON.stringify({
-                    token: useAnonymousIrc ? "" : token.trim(),
-                    channelOrUrl: channelOrUrl.trim(),
-                    currentGame: currentGame.trim(),
-                    thresholdScoreExclusive: threshold,
-                  }),
-                });
-                const j = (await r.json()) as unknown;
-                const sid = isRecord(j) && typeof j["sessionId"] === "string" ? j["sessionId"] : null;
-                if (!sid) {
-                  setIsRunning(false);
-                  setLogText(JSON.stringify(j, null, 2));
-                  return;
-                }
-                setSessionId(sid);
-                setLogText(`Live session started: ${sid}\nPolling...`);
-                setTimeout(() => void poll(sid), 250);
-              }}
+          <div className="mt-4 flex items-center justify-between gap-2">
+            <div className="flex flex-wrap gap-2">
+              <button
+                className="twitch-button-primary"
+                disabled={isRunning || !canStart}
+                onClick={async () => {
+                  setErrorText(null);
+                  setIsRunning(true);
+                  setLogText("Starting live session...");
+                  const r = await fetch("/api/live/start", {
+                    method: "POST",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify({
+                      currentGame: currentGame.trim(),
+                      thresholdScoreExclusive: threshold,
+                    }),
+                  });
+                  const j = (await r.json()) as unknown;
+                  const sid = isRecord(j) && typeof j["sessionId"] === "string" ? j["sessionId"] : null;
+                  if (!sid) {
+                    setIsRunning(false);
+                    setLogText(JSON.stringify(j, null, 2));
+                    return;
+                  }
+                  setSessionId(sid);
+                  setLogText(`Live session started: ${sid}\nPolling...`);
+                  setTimeout(() => void poll(sid), 250);
+                }}
+              >
+                {isRunning ? `Running${sessionId ? ` (${sessionId})` : ""}...` : "Start live session"}
+              </button>
+              <button
+                className="twitch-button-secondary"
+                disabled={!sessionId || isRunning === false}
+                onClick={async () => {
+                  if (!sessionId) return;
+                  await fetch("/api/live/stop", {
+                    method: "POST",
+                    headers: { "content-type": "application/json" },
+                    body: JSON.stringify({ sessionId }),
+                  });
+                  setLogText((prev) => `${prev}\nStop requested...`);
+                }}
+              >
+                Stop
+              </button>
+            </div>
+            <Link
+              href={sessionId ? `/live/highlights?sessionId=${encodeURIComponent(sessionId)}` : "/live/highlights"}
+              className="twitch-button-secondary inline-flex items-center"
             >
-              {isRunning ? `Running${sessionId ? ` (${sessionId})` : ""}...` : "Start live session"}
-            </button>
-            <button
-              className="twitch-button-secondary"
-              disabled={!sessionId || isRunning === false}
-              onClick={async () => {
-                if (!sessionId) return;
-                await fetch("/api/live/stop", {
-                  method: "POST",
-                  headers: { "content-type": "application/json" },
-                  body: JSON.stringify({ sessionId }),
-                });
-                setLogText((prev) => `${prev}\nStop requested...`);
-              }}
-            >
-              Stop
-            </button>
+              Open live highlighted chat
+            </Link>
           </div>
 
           {status ? (
