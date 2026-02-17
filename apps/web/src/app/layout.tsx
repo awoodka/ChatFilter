@@ -1,6 +1,7 @@
 import type { Metadata } from "next";
 import { Geist, Geist_Mono } from "next/font/google";
 import AppNavbar from "./_components/AppNavbar";
+import LiveSnapshotRouteGuard from "./_components/LiveSnapshotRouteGuard";
 import "./globals.css";
 
 const geistSans = Geist({
@@ -28,6 +29,7 @@ export default function RootLayout({
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >
+        <LiveSnapshotRouteGuard />
         <AppNavbar />
         <main>{children}</main>
       </body>

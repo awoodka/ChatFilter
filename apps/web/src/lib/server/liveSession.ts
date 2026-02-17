@@ -9,7 +9,9 @@ import { appendJobLog, JobStatus, readJobStatus, writeJobStatus } from "@/lib/jo
 import { runCommand } from "@/lib/proc";
 import { createJudgeRateLimiter, scoreWithRetries } from "@/lib/server/judge";
 import { LiveContext, upsertLiveContext } from "@/lib/server/liveContext";
+import { recordUserLiveMetricDeltas } from "@/lib/server/liveUserStats";
 import { getEvalServerConfig } from "@/lib/server/evalConfig";
+import { buildHighlightUserPrompt, deriveVibeFromLongTerm } from "@/lib/server/highlightPrompt";
 import { dataRootDir } from "@/lib/vod";
 
 type LiveStartRequest = {
@@ -79,14 +81,6 @@ function tsLine(line: string): string {
 function truncateLine(s: string, n: number): string {
   const t = String(s ?? "").trim().replace(/\s+/g, " ");
   return t.length <= n ? t : `${t.slice(0, Math.max(0, n - 1))}…`;
-}
-
-function deriveVibeFromLongTerm(text: string): string | undefined {
-  const raw = String(text ?? "").trim();
-  if (!raw) return undefined;
-  const firstLine = raw.split("\n").map((x) => x.trim()).find(Boolean) ?? "";
-  if (!firstLine) return undefined;
-  return truncateLine(firstLine, 180);
 }
 
 function pct(num: number, den: number): number {
@@ -706,6 +700,39 @@ export async function startLiveSession(req: LiveStartRequest): Promise<void> {
     highlighted: 0,
     retries429: 0,
   };
+  const persistedCountState = { seen: 0, kept: 0, highlighted: 0 };
+  let lastMetricPersistMs = 0;
+
+  async function maybePersistUserMetricDeltas(force = false) {
+    const nowMs = Date.now();
+    if (!force && nowMs - lastMetricPersistMs < 10_000) return;
+    const seenDelta = Math.max(0, counts.seen - persistedCountState.seen);
+    const filteredDelta = Math.max(0, counts.kept - persistedCountState.kept);
+    const highlightedDelta = Math.max(0, counts.highlighted - persistedCountState.highlighted);
+    if (seenDelta <= 0 && filteredDelta <= 0 && highlightedDelta <= 0) {
+      lastMetricPersistMs = nowMs;
+      return;
+    }
+    try {
+      recordUserLiveMetricDeltas({
+        userId: req.userId,
+        sessionId,
+        tsMs: nowMs,
+        seenDelta,
+        filteredDelta,
+        highlightedDelta,
+      });
+      persistedCountState.seen = counts.seen;
+      persistedCountState.kept = counts.kept;
+      persistedCountState.highlighted = counts.highlighted;
+      lastMetricPersistMs = nowMs;
+    } catch (err: unknown) {
+      await appendJobLog(
+        sessionId,
+        tsLine(`live metrics persist warning: ${err instanceof Error ? err.message : String(err)}`),
+      );
+    }
+  }
 
   async function flushLatest() {
     const chat = (await tailJsonl(chatPath, 200)).slice(-200);
@@ -802,39 +829,14 @@ export async function startLiveSession(req: LiveStartRequest): Promise<void> {
   async function scoreAndEmit(msg: LiveMsg) {
     if (await shouldStop()) return;
     const liveCtx = latestLiveContext ?? buildLiveContext(Date.now());
-    const longTermProfile = truncateLine(req.longTermCacheText || cfg.longTermCache || "(empty)", 2400);
-    const currentGame = truncateLine(liveCtx.currentGame || "an unknown game", 120);
-    const vibe = truncateLine(liveCtx.vibe || "not specified", 180);
-    const transcriptText = transcriptTail.length
-      ? transcriptTail
-          .slice(-8)
-          .map((line) => truncateLine(line, 220))
-          .filter(Boolean)
-          .join("\n")
-      : "(no transcript available)";
-    const recentChatText = recentChat.length
-      ? recentChat
-          .slice(-10)
-          .map((m) => truncateLine(m.text, 220))
-          .filter(Boolean)
-          .join("\n")
-      : "(no recent chat)";
-    const candidateMessage = truncateLine(msg.text, 500);
-    const userPrompt = `This streamer's personality and preferences:
-${longTermProfile}
-
-Right now they are playing ${currentGame || "an unknown game"}. The stream vibe is: ${vibe || "not specified"}.
-
-Here is what the streamer has been saying on stream recently (transcript):
-${transcriptText}
-
-Here is what chat has been talking about recently:
-${recentChatText}
-
-The candidate chat message to evaluate:
-"${candidateMessage}"
-
-Remember: use the streamer profile above to judge humor and engagement - what matters is whether THIS streamer would react, not whether it's generically funny. Score each axis 0-10, compute total, and return JSON only.`;
+    const userPrompt = buildHighlightUserPrompt({
+      longTermProfileText: req.longTermCacheText || cfg.longTermCache || "(empty)",
+      currentGame: liveCtx.currentGame || "an unknown game",
+      vibe: liveCtx.vibe || "not specified",
+      transcriptLines: transcriptTail.slice(-8),
+      recentChatLines: recentChat.slice(-10).map((m) => m.text),
+      candidateMessageText: msg.text,
+    });
     const res = await scoreWithRetries({
       apiKey: apiKeyRequired,
       model: cfg.model,
@@ -1065,6 +1067,7 @@ Remember: use the streamer profile above to judge humor and engagement - what ma
       while (!(await shouldStop()) && !ffClosed) {
         await flushLatest();
         await maybePersistLiveContext(false);
+        await maybePersistUserMetricDeltas(false);
         await sleep(1200);
       }
 
@@ -1105,6 +1108,7 @@ Remember: use the streamer profile above to judge humor and engagement - what ma
     while (!(await shouldStop())) {
       await flushLatest();
       await maybePersistLiveContext(false);
+      await maybePersistUserMetricDeltas(false);
       await new Promise((r) => setTimeout(r, 1200));
       // keep service alive until stop; chat scoring continues on socket callbacks
     }
@@ -1113,6 +1117,7 @@ Remember: use the streamer profile above to judge humor and engagement - what ma
     await Promise.allSettled(Array.from(inFlightScoring));
     await flushLatest();
     await maybePersistLiveContext(true);
+    await maybePersistUserMetricDeltas(true);
     const done = await readJobStatus(sessionId);
     const finalStatus: JobStatus = {
       ...(done ?? status),
@@ -1127,6 +1132,7 @@ Remember: use the streamer profile above to judge humor and engagement - what ma
     abortScoring();
     await Promise.allSettled(Array.from(inFlightScoring));
     await maybePersistLiveContext(true);
+    await maybePersistUserMetricDeltas(true);
     const msg = err instanceof Error ? err.message : String(err);
     const failed = await readJobStatus(sessionId);
     const finalStatus: JobStatus = {

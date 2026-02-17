@@ -142,3 +142,12 @@ export function saveLiveSnapshotPatch(patch: Partial<LiveSessionSnapshot>): void
     // ignore storage failures
   }
 }
+
+export function clearLiveSnapshot(): void {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.removeItem(LIVE_SNAPSHOT_STORAGE_KEY);
+  } catch {
+    // ignore storage failures
+  }
+}

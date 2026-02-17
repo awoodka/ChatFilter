@@ -15,6 +15,11 @@ type JobStatus = {
   error?: string;
 };
 
+type VodOption = {
+  vodId: string;
+  vodName: string;
+};
+
 type EvalResultsResponse = {
   ok: boolean;
   jobId: string;
@@ -53,7 +58,7 @@ function toHighScoringMsg(obj: Record<string, unknown>): HighScoringMsg | null {
 }
 
 export default function EvalPage() {
-  const [vodIds, setVodIds] = useState<string[]>([]);
+  const [vods, setVods] = useState<VodOption[]>([]);
   const [vodId, setVodId] = useState<string>("");
   const [scope, setScope] = useState<"full" | "first_n">("full");
   const [firstN, setFirstN] = useState<number>(500);
@@ -71,11 +76,18 @@ export default function EvalPage() {
     const r = await fetch("/api/vods", { cache: "no-store" });
     const j = (await r.json()) as unknown;
     if (!isRecord(j) || j["ok"] !== true) return;
-    const ids = j["vodIds"];
-    if (!Array.isArray(ids)) return;
-    const cleaned = ids.filter((x) => typeof x === "string");
-    setVodIds(cleaned);
-    if (!vodId && cleaned.length > 0) setVodId(cleaned[0]!);
+    const rawVods = Array.isArray(j["vods"]) ? j["vods"] : [];
+    const parsed = rawVods
+      .map((x) => {
+        if (!isRecord(x)) return null;
+        const id = x["vodId"];
+        const name = x["vodName"];
+        if (typeof id !== "string" || typeof name !== "string") return null;
+        return { vodId: id, vodName: name };
+      })
+      .filter((x): x is VodOption => Boolean(x));
+    setVods(parsed);
+    if (!vodId && parsed.length > 0) setVodId(parsed[0]!.vodId);
   };
 
   const initialJobId = useMemo(() => {
@@ -157,11 +169,18 @@ export default function EvalPage() {
         const r = await fetch("/api/vods", { cache: "no-store" });
         const j = (await r.json()) as unknown;
         if (!isRecord(j) || j["ok"] !== true) return;
-        const ids = j["vodIds"];
-        if (!Array.isArray(ids)) return;
-        const cleaned = ids.filter((x) => typeof x === "string");
-        if (!cancelled) setVodIds(cleaned);
-        if (!cancelled && !vodId && cleaned.length > 0) setVodId(cleaned[0]!);
+        const rawVods = Array.isArray(j["vods"]) ? j["vods"] : [];
+        const parsed = rawVods
+          .map((x) => {
+            if (!isRecord(x)) return null;
+            const id = x["vodId"];
+            const name = x["vodName"];
+            if (typeof id !== "string" || typeof name !== "string") return null;
+            return { vodId: id, vodName: name };
+          })
+          .filter((x): x is VodOption => Boolean(x));
+        if (!cancelled) setVods(parsed);
+        if (!cancelled && !vodId && parsed.length > 0) setVodId(parsed[0]!.vodId);
       } catch {
         // ignore (dashboard still works with manual VOD id entry later if needed)
       }
@@ -185,7 +204,8 @@ export default function EvalPage() {
         <div className="twitch-card mt-6 p-5">
           <h2 className="text-base font-medium">Import a Twitch VOD</h2>
           <p className="twitch-muted mt-1 text-sm">
-            Paste a Twitch VOD URL to download chat + audio, transcribe, convert to JSONL, and filter messages for eval.
+            Paste a Twitch VOD URL to download chat + audio, transcribe, convert to JSONL, and filter messages for eval. Imported
+            VODs are scoped to your account.
           </p>
           <VodImportForm onImported={async () => void loadVodIds()} />
         </div>
@@ -198,12 +218,12 @@ export default function EvalPage() {
               onChange={(e) => setVodId(e.target.value)}
               className="twitch-input"
             >
-              {vodIds.length === 0 ? (
+              {vods.length === 0 ? (
                 <option value="">No imported VODs found</option>
               ) : (
-                vodIds.map((id) => (
-                  <option key={id} value={id}>
-                    {id}
+                vods.map((v) => (
+                  <option key={v.vodId} value={v.vodId}>
+                    {v.vodName} ({v.vodId})
                   </option>
                 ))
               )}
@@ -492,12 +512,12 @@ function VodImportForm({ onImported }: { onImported?: () => Promise<void> | void
         const form = e.currentTarget as HTMLFormElement;
         const fd = new FormData(form);
         const vodUrl = String(fd.get("vodUrl") ?? "");
-        const channel = String(fd.get("channel") ?? "");
+        const vodName = String(fd.get("vodName") ?? "");
         try {
           const res = await fetch("/api/vod/import", {
             method: "POST",
             headers: { "content-type": "application/json" },
-            body: JSON.stringify({ vodUrl, channel: channel || undefined, targetKeep: 0.2 }),
+            body: JSON.stringify({ vodUrl, vodName }),
           });
           const contentType = res.headers.get("content-type") ?? "";
           if (contentType.includes("application/json")) {
@@ -533,14 +553,15 @@ function VodImportForm({ onImported }: { onImported?: () => Promise<void> | void
         className="twitch-input"
         required
       />
-      <label className="text-sm font-medium" htmlFor="evalChannel">
-        Channel (optional)
+      <label className="text-sm font-medium" htmlFor="evalVodName">
+        VOD name
       </label>
       <input
-        id="evalChannel"
-        name="channel"
-        placeholder="streamername"
+        id="evalVodName"
+        name="vodName"
+        placeholder="Ludwig - Ranked Grind - 2026-02-17"
         className="twitch-input"
+        required
       />
       <button
         type="submit"
@@ -555,4 +576,3 @@ function VodImportForm({ onImported }: { onImported?: () => Promise<void> | void
     </form>
   );
 }
-

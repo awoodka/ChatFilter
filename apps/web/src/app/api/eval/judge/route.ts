@@ -10,7 +10,9 @@ import { extractVodId, legacyCachesDir, userCachesDir, vodDir } from "@/lib/vod"
 import { getEvalServerConfig } from "@/lib/server/evalConfig";
 import { LongTermCache, SessionCache, ShortTermCache, readJson, writeJson } from "@/lib/server/caches";
 import { createJudgeRateLimiter, scoreWithRetries } from "@/lib/server/judge";
+import { buildHighlightUserPrompt, deriveVibeFromLongTerm } from "@/lib/server/highlightPrompt";
 import { getOrCreateUserProfile, updateUserProfile } from "@/lib/server/userProfile";
+import { userOwnsVod } from "@/lib/server/vodOwnership";
 import { isJobOwnedByUser, requireAuthUser } from "@/lib/server/routeAuth";
 
 export const runtime = "nodejs";
@@ -143,11 +145,6 @@ function tsLine(line: string) {
   return `[${new Date().toISOString()}] ${line}\n`;
 }
 
-function truncatePromptLine(s: string, n: number): string {
-  const t = String(s ?? "").trim().replace(/\s+/g, " ");
-  return t.length <= n ? t : `${t.slice(0, Math.max(0, n - 1))}…`;
-}
-
 function jsonError(message: string, status = 400, extra?: Record<string, unknown>) {
   return NextResponse.json({ ok: false, error: message, ...extra }, { status });
 }
@@ -177,21 +174,6 @@ async function listFiles(p: string): Promise<string[]> {
   } catch {
     return [];
   }
-}
-
-async function newestRunDir(vodId: string): Promise<string | null> {
-  const runs = path.join(vodDir(vodId), "runs");
-  const dirs = await listDirs(runs);
-  if (dirs.length === 0) return null;
-  const withStats = await Promise.all(
-    dirs.map(async (d) => {
-      const full = path.join(runs, d);
-      const st = await fs.stat(full);
-      return { full, mtimeMs: st.mtimeMs };
-    }),
-  );
-  withStats.sort((a, b) => b.mtimeMs - a.mtimeMs);
-  return withStats[0]?.full ?? null;
 }
 
 async function newestCanonicalChat(vodId: string): Promise<string | null> {
@@ -317,6 +299,12 @@ async function runEvalJob(jobId: string, body: EvalRequest, user: { id: string; 
     await appendJobLog(jobId, tsLine(`error: ${job.error}`));
     return;
   }
+  if (!userOwnsVod(user.id, vodId)) {
+    job = { ...job, state: "failed", updatedAt: Date.now(), error: "VOD is not associated with this account" };
+    await writeJobStatus(job);
+    await appendJobLog(jobId, tsLine(`error: ${job.error}`));
+    return;
+  }
 
   const model = cfg.model;
   const maxMessages = cfg.maxMessages;
@@ -334,17 +322,9 @@ async function runEvalJob(jobId: string, body: EvalRequest, user: { id: string; 
 
   const canonicalChatJsonl = body.canonicalChatJsonl ?? (await newestCanonicalChat(vodId));
   const transcriptJsonl = body.transcriptJsonl ?? (await newestTranscript(vodId));
-  const runDir = await newestRunDir(vodId);
-  const filteredJsonl = body.filteredJsonl ?? (runDir ? path.join(runDir, "filtered.jsonl") : null);
 
   if (!canonicalChatJsonl || !(await fileExists(canonicalChatJsonl))) {
     job = { ...job, state: "failed", updatedAt: Date.now(), error: "Missing canonicalChatJsonl" };
-    await writeJobStatus(job);
-    await appendJobLog(jobId, tsLine(`error: ${job.error}`));
-    return;
-  }
-  if (!filteredJsonl || !(await fileExists(filteredJsonl))) {
-    job = { ...job, state: "failed", updatedAt: Date.now(), error: "Missing filteredJsonl" };
     await writeJobStatus(job);
     await appendJobLog(jobId, tsLine(`error: ${job.error}`));
     return;
@@ -371,12 +351,15 @@ async function runEvalJob(jobId: string, body: EvalRequest, user: { id: string; 
   let resultsJsonl: string;
   let summaryJson: string;
   let labeledChatJsonl: string;
+  let filteredJsonl: string;
+  const filteredMetricsJsonName = "filtered_live_equivalent.metrics.json";
 
   if (isResume && existingOutDir && existingResults) {
     outDir = existingOutDir;
     resultsJsonl = existingResults;
     summaryJson = existingSummary ?? path.join(outDir, "summary.json");
     labeledChatJsonl = existingLabeled ?? path.join(outDir, "labeled_chat.jsonl");
+    filteredJsonl = path.join(outDir, "filtered_live_equivalent.jsonl");
     await fs.mkdir(outDir, { recursive: true });
   } else {
     const evalDir = path.join(vodDir(vodId), "evals");
@@ -387,6 +370,7 @@ async function runEvalJob(jobId: string, body: EvalRequest, user: { id: string; 
     resultsJsonl = path.join(outDir, "results.jsonl");
     summaryJson = path.join(outDir, "summary.json");
     labeledChatJsonl = path.join(outDir, "labeled_chat.jsonl");
+    filteredJsonl = path.join(outDir, "filtered_live_equivalent.jsonl");
     await fs.writeFile(resultsJsonl, "", "utf-8");
   }
 
@@ -407,6 +391,7 @@ async function runEvalJob(jobId: string, body: EvalRequest, user: { id: string; 
     ...process.env,
     PYTHONPATH: process.env.PYTHONPATH ? `${pythonPath}:${process.env.PYTHONPATH}` : pythonPath,
   };
+  const knownEmotes = userProfile.emotes.filter((x) => x.trim()).slice(0, 200);
 
   job = {
     ...job,
@@ -457,6 +442,41 @@ async function runEvalJob(jobId: string, body: EvalRequest, user: { id: string; 
     }
   } else {
     await appendJobLog(jobId, tsLine(`align skipped (labeled_chat.jsonl already exists)`));
+  }
+
+  // Recompute a live-equivalent filtered file for eval so offline scoring uses the same filter logic as live.
+  // `chatfilter filter` uses the same hard filter core (`evaluate_live_candidate`) as live mode.
+  // We set target-keep=1.0 so no additional quantile thinning is applied.
+  job = { ...job, updatedAt: Date.now(), step: "filter_live_equivalent" };
+  await writeJobStatus(job);
+  await appendJobLog(jobId, tsLine(`step filter_live_equivalent target_keep=1.0 resume=${isResume ? 1 : 0}`));
+  if (!(isResume && (await fileExists(filteredJsonl)))) {
+    const pyFilter = await runCommandStreaming(
+      "python3",
+      [
+        "-m",
+        "chatfilter",
+        "filter",
+        "--input",
+        canonicalChatJsonl,
+        "--output",
+        filteredJsonl,
+        "--metrics",
+        path.join(outDir, filteredMetricsJsonName),
+        "--target-keep",
+        "1.0",
+        ...knownEmotes.flatMap((e) => ["--known-emote", e]),
+      ],
+      { env: pyEnv, onLine: (l, s) => void appendJobLog(jobId, tsLine(`${s}: ${l}`)) },
+    );
+    if (pyFilter.code !== 0) {
+      job = { ...job, state: "failed", updatedAt: Date.now(), error: "Python chatfilter filter (live-equivalent) failed" };
+      await writeJobStatus(job);
+      await appendJobLog(jobId, tsLine(`error: ${job.error}`));
+      return;
+    }
+  } else {
+    await appendJobLog(jobId, tsLine(`filter_live_equivalent skipped (existing output)`));
   }
 
   job = { ...job, updatedAt: Date.now(), step: "load" };
@@ -583,27 +603,6 @@ async function runEvalJob(jobId: string, body: EvalRequest, user: { id: string; 
     for (const tok of tokensForTopics(m.text)) tokenCounts.set(tok, (tokenCounts.get(tok) ?? 0) + 1);
     const phrase = normForTokens(m.text);
     if (phrase.length >= 12 && phrase.length <= 80) phraseCounts.set(phrase, (phraseCounts.get(phrase) ?? 0) + 1);
-  }
-
-  function sessionCacheText(): string {
-    const topUsers = clampTopN(Array.from(userCounts.entries()), 5)
-      .map(([u, c]) => `${u}(${c})`)
-      .join(", ");
-    const topTopics = clampTopN(Array.from(tokenCounts.entries()), 12)
-      .map(([t, c]) => `${t}(${c})`)
-      .join(", ");
-    const topChants = clampTopN(
-      Array.from(phraseCounts.entries()).filter(([, c]) => c >= 5),
-      3,
-    )
-      .map(([p, c]) => `"${p}"(${c})`)
-      .join(", ");
-
-    return [
-      `Top chatters so far: ${topUsers || "(none)"}`,
-      `Top topics so far: ${topTopics || "(none)"}`,
-      `Crowd chants / repeated phrases: ${topChants || "(none)"}`,
-    ].join("\n");
   }
 
   function maybeUpdateSessionCache(ts_ms: number) {
@@ -774,44 +773,14 @@ async function runEvalJob(jobId: string, body: EvalRequest, user: { id: string; 
     const ctx = shortCache.recent_chat.slice(-contextMessages);
     const onStream = shortCache.transcript_last_60s;
 
-    const profileText = truncatePromptLine(longCache.streamer_style_summary || cfg.longTermCache || "(empty)", 2400);
-    const transcriptText = onStream.length
-      ? onStream
-          .slice(-8)
-          .map((t) => truncatePromptLine(t, 220))
-          .filter(Boolean)
-          .join("\n")
-      : "(no transcript available)";
-    const recentChatText = ctx.length
-      ? ctx
-          .slice(-contextMessages)
-          .map((t) => truncatePromptLine(t, 220))
-          .filter(Boolean)
-          .join("\n")
-      : "(no recent chat)";
-    const positiveExamples =
-      longCache.positive_examples.length > 0
-        ? `\n\nHere are examples of messages this streamer has engaged with before:\n${longCache.positive_examples
-            .slice(0, 8)
-            .map((x) => `- ${truncatePromptLine(x, 180)}`)
-            .join("\n")}`
-        : "";
-    const userPrompt = `This streamer's personality and preferences:
-${profileText}${positiveExamples}
-
-At this moment in the stream, the broader session patterns look like this:
-${sessionCacheText()}
-
-Here is what the streamer has been saying on stream recently (transcript):
-${transcriptText}
-
-Here is what chat has been talking about recently:
-${recentChatText}
-
-The candidate chat message to evaluate:
-"${truncatePromptLine(msg.text, 500)}"
-
-Remember: use the streamer profile above to judge humor and engagement - what matters is whether THIS streamer would react, not whether it's generically funny. Score each axis 0-10, compute total, and return JSON only.`;
+    const userPrompt = buildHighlightUserPrompt({
+      longTermProfileText: longCache.streamer_style_summary || cfg.longTermCache || "(empty)",
+      currentGame: "an unknown game",
+      vibe: deriveVibeFromLongTerm(longCache.streamer_style_summary || cfg.longTermCache || ""),
+      transcriptLines: onStream,
+      recentChatLines: ctx.slice(-contextMessages),
+      candidateMessageText: msg.text,
+    });
     prepared.push({ i, msg, key, label, userPrompt });
   }
 
@@ -1027,6 +996,9 @@ export async function POST(req: Request) {
     return jsonError("Invalid JSON body");
   }
   if (!body?.vodUrlOrId || typeof body.vodUrlOrId !== "string") return jsonError("Missing vodUrlOrId");
+  const vodId = extractVodId(body.vodUrlOrId ?? "");
+  if (!vodId) return jsonError("Could not extract VOD id", 400);
+  if (!userOwnsVod(user.id, vodId)) return jsonError("VOD not found", 404);
 
   const resumeJobId = typeof body.resumeJobId === "string" ? body.resumeJobId.trim() : "";
   if (resumeJobId) {

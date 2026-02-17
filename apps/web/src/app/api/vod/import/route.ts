@@ -7,15 +7,15 @@ import { runCommandStreaming } from "@/lib/proc";
 import { extractVodId, vodCanonicalDir, vodRawDir, vodRunsDir } from "@/lib/vod";
 import { requireAuthUser } from "@/lib/server/routeAuth";
 import { getOrCreateUserProfile } from "@/lib/server/userProfile";
+import { linkVodToUser } from "@/lib/server/vodOwnership";
 
 export const runtime = "nodejs";
 
 type ImportRequest = {
   vodUrl: string;
-  channel?: string;
+  vodName: string;
   twitchDownloaderPath?: string; // optional override
   ytDlpPath?: string; // optional override
-  targetKeep?: number;
 };
 
 function jsonError(message: string, status = 400, extra?: Record<string, unknown>) {
@@ -129,7 +129,6 @@ async function runImportJob(jobId: string, body: ImportRequest, user: { id: stri
     await appendJobLog(jobId, tsLine(`error: ${job.error}`));
     return;
   }
-  const channel = body.channel ?? null;
 
   const repoRoot = path.join(process.cwd(), "..", "..");
   const tdLocal = path.join(repoRoot, "tools", "TwitchDownloaderCLI");
@@ -137,11 +136,10 @@ async function runImportJob(jobId: string, body: ImportRequest, user: { id: stri
   const ffmpegDir = path.join(repoRoot, "tools", "ffmpeg");
   const td = body.twitchDownloaderPath ?? process.env.TWITCHDOWNLOADER_PATH ?? tdLocal ?? "TwitchDownloaderCLI";
   const ytdlp = body.ytDlpPath ?? process.env.YTDLP_PATH ?? ytdlpLocal ?? "yt-dlp";
-  const targetKeep = typeof body.targetKeep === "number" ? body.targetKeep : 0.2;
   const profile = getOrCreateUserProfile(user.id);
   const knownEmotes = profile.emotes.filter((x) => x.trim()).slice(0, 200);
 
-  job = { ...job, updatedAt: Date.now(), vodId, channel };
+  job = { ...job, updatedAt: Date.now(), vodId };
   await writeJobStatus(job);
 
   const rawDir = vodRawDir(vodId);
@@ -351,7 +349,6 @@ async function runImportJob(jobId: string, body: ImportRequest, user: { id: stri
       canonicalChatJsonl,
       "--vod-id",
       vodId,
-      ...(channel ? ["--channel", channel] : []),
     ],
     { env: pyEnv, onLine: (l, s) => void logLine(l, s) },
   );
@@ -365,7 +362,7 @@ async function runImportJob(jobId: string, body: ImportRequest, user: { id: stri
   // 5) Filter
   job = { ...job, updatedAt: Date.now(), step: "filter" };
   await writeJobStatus(job);
-  await logLine(`step filter targetKeep=${targetKeep}`);
+  await logLine("step filter live_equivalent=true targetKeep=1.0");
 
   const filteredJsonl = path.join(runDir, "filtered.jsonl");
   const metricsJson = path.join(runDir, "metrics.json");
@@ -382,7 +379,7 @@ async function runImportJob(jobId: string, body: ImportRequest, user: { id: stri
       "--metrics",
       metricsJson,
       "--target-keep",
-      String(targetKeep),
+      "1.0",
       ...knownEmotes.flatMap((e) => ["--known-emote", e]),
     ],
     { env: pyEnv, onLine: (l, s) => void logLine(l, s) },
@@ -409,6 +406,7 @@ async function runImportJob(jobId: string, body: ImportRequest, user: { id: stri
     },
   };
   await writeJobStatus(job);
+  linkVodToUser(user.id, vodId, body.vodName);
   await logLine(`job done runId=${runId}`);
 }
 
@@ -422,6 +420,8 @@ export async function POST(req: Request) {
   } catch {
     return jsonError("Invalid JSON body");
   }
+  const vodName = String(body.vodName ?? "").trim();
+  if (!vodName) return jsonError("Missing vodName");
 
   const jobId = `job_${Date.now()}_${Math.random().toString(16).slice(2)}`;
   const createdAt = Date.now();
@@ -432,14 +432,13 @@ export async function POST(req: Request) {
     createdAt,
     updatedAt: createdAt,
     step: "init",
-    meta: { userId: auth.user.id, username: auth.user.username },
+    meta: { userId: auth.user.id, username: auth.user.username, vodName },
   });
 
   // fire-and-forget (MVP). For production, this should be a real job queue/worker.
   setTimeout(() => {
-    void runImportJob(jobId, body, auth.user);
+    void runImportJob(jobId, { ...body, vodName }, auth.user);
   }, 10);
 
   return NextResponse.json({ ok: true, jobId });
 }
-
