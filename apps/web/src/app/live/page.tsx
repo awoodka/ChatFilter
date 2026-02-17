@@ -2,7 +2,7 @@
 
 import Link from "next/link";
 import { useSearchParams } from "next/navigation";
-import { useCallback, useEffect, useRef, useState } from "react";
+import { type CSSProperties, useCallback, useEffect, useRef, useState } from "react";
 import {
   LiveFeedMessage,
   LiveStatus,
@@ -37,6 +37,7 @@ export default function LivePage() {
   const pollRef = useRef<(sid: string) => Promise<void>>(async () => {});
 
   const canStart = Boolean(linkedChannelUrl.trim());
+  const thresholdSliderStyle = { "--slider-fill": `${threshold}%` } as CSSProperties;
 
   useEffect(() => {
     let cancelled = false;
@@ -222,6 +223,7 @@ export default function LivePage() {
                   max={100}
                   step={1}
                   onChange={(e) => setThreshold(Math.max(0, Math.min(100, Number(e.target.value || "80"))))}
+                  style={thresholdSliderStyle}
                   className="twitch-slider"
                 />
               </div>

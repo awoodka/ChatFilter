@@ -346,6 +346,14 @@ export default function Home() {
         <div className="twitch-card mt-4 p-4">
           <div className="flex items-center justify-between gap-3">
             <div className="text-sm font-medium">Live monitor status</div>
+          </div>
+          <div className="mt-3 flex flex-wrap items-center justify-between gap-3">
+            <Link
+              href={liveSessionId ? `/live?sessionId=${encodeURIComponent(liveSessionId)}` : "/live"}
+              className="twitch-button-secondary inline-flex items-center"
+            >
+              Open live monitor
+            </Link>
             <div
               className={`inline-flex items-center gap-2 rounded-full border px-2 py-1 text-xs font-semibold ${
                 liveIndicator === "live"
@@ -364,7 +372,7 @@ export default function Home() {
                     : liveIndicator === "checking"
                       ? "bg-[#c9a3ff]"
                       : liveIndicator === "error"
-                        ? "bg-amber-300"
+                    ? "bg-amber-300"
                         : "bg-zinc-500"
                 }`}
               />
@@ -376,18 +384,6 @@ export default function Home() {
                     ? "Status unavailable"
                     : "Not running"}
             </div>
-          </div>
-          <div className="mt-2 text-xs twitch-muted">
-            {liveSessionId && liveIndicator === "live" ? (
-              <>
-                Session <code className="twitch-code">{liveSessionId}</code> is active.{" "}
-                <Link href={`/live?sessionId=${encodeURIComponent(liveSessionId)}`} className="twitch-link">
-                  Open live monitor
-                </Link>
-              </>
-            ) : (
-              "Start a live session from Main MVP to enable real-time monitoring."
-            )}
           </div>
         </div>
 
@@ -433,11 +429,7 @@ export default function Home() {
           )}
         </div>
 
-        <div className="mt-3 text-sm twitch-muted">
-          Choose a workflow. Testing tools are stable now; Live MVP is the next build-out surface.
-        </div>
-
-        <div className="mt-6 grid gap-4 sm:grid-cols-2">
+        <div className="mt-6 grid gap-4 sm:grid-cols-1">
           <Link
             href="/eval"
             className="twitch-card block p-5 transition-colors hover:border-[#9147ff]"
@@ -447,17 +439,6 @@ export default function Home() {
               Run offline evals on imported VODs, inspect metrics, and review high-scoring + read-aloud chats.
             </div>
             <div className="mt-3 text-xs twitch-link">Open /eval</div>
-          </Link>
-
-          <Link
-            href="/live"
-            className="twitch-card block p-5 transition-colors hover:border-[#9147ff]"
-          >
-            <div className="text-base font-medium">Main MVP (Live)</div>
-            <div className="mt-1 text-sm twitch-muted">
-              Connect Twitch IRC + local transcription input to surface live &quot;good chats&quot; in real time.
-            </div>
-            <div className="mt-3 text-xs twitch-link">Open /live</div>
           </Link>
         </div>
 
