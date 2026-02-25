@@ -11,6 +11,8 @@ export type LiveContext = {
     highlightRate: number;
   };
   recentChatSample: string[];
+  visualContext?: string;
+  detectedGame?: string;
   updatedAtMs: number;
 };
 
@@ -20,6 +22,7 @@ const MAX_EVENT_LEN = 220;
 const MAX_CHAT_LEN = 220;
 const MAX_VIBE_LEN = 180;
 const MAX_GAME_LEN = 120;
+const MAX_VISUAL_CONTEXT_LEN = 500;
 
 function clampPercent(v: number): number {
   if (!Number.isFinite(v)) return 0;
@@ -67,6 +70,8 @@ function parseLiveContextJson(text: string): LiveContext | null {
         highlightRate: Number(stats["highlightRate"] ?? 0),
       },
       recentChatSample,
+      visualContext: typeof rec["visualContext"] === "string" ? rec["visualContext"] : undefined,
+      detectedGame: typeof rec["detectedGame"] === "string" ? rec["detectedGame"] : undefined,
       updatedAtMs: Number(rec["updatedAtMs"] ?? Date.now()),
     });
   } catch {
@@ -86,6 +91,8 @@ export function normalizeLiveContext(input: LiveContext): LiveContext {
       highlightRate: clampPercent(Number(input.streamStats.highlightRate)),
     },
     recentChatSample: sanitizeLines(input.recentChatSample ?? [], MAX_CHAT_SAMPLES, MAX_CHAT_LEN),
+    visualContext: input.visualContext?.trim().slice(0, MAX_VISUAL_CONTEXT_LEN) || undefined,
+    detectedGame: input.detectedGame?.trim().slice(0, MAX_GAME_LEN) || undefined,
     updatedAtMs: Number.isFinite(input.updatedAtMs) ? input.updatedAtMs : Date.now(),
   };
 }

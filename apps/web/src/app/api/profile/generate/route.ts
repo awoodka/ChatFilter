@@ -1,6 +1,7 @@
 import { NextResponse } from "next/server";
 
 import { requireAuthUser } from "@/lib/server/routeAuth";
+import { getUserFeedbackSummary } from "@/lib/server/userFeedback";
 import { getOrCreateUserProfile, updateUserProfile } from "@/lib/server/userProfile";
 
 export const runtime = "nodejs";
@@ -50,7 +51,28 @@ export async function POST(req: Request) {
   }
 
   const profile = getOrCreateUserProfile(auth.user.id);
-  const userPrompt = questionnaireToPrompt(profile.streamQuestionnaire);
+  let userPrompt = questionnaireToPrompt(profile.streamQuestionnaire);
+
+  const fbSummary = getUserFeedbackSummary(auth.user.id);
+  if (fbSummary.totalUp + fbSummary.totalDown > 0) {
+    const lines: string[] = [];
+    lines.push("");
+    lines.push(`Feedback data (${fbSummary.totalUp} upvotes, ${fbSummary.totalDown} downvotes):`);
+    if (fbSummary.recentUpTexts.length > 0) {
+      lines.push("Messages the streamer marked as good picks:");
+      for (const text of fbSummary.recentUpTexts) {
+        lines.push(`  + "${text}"`);
+      }
+    }
+    if (fbSummary.recentDownTexts.length > 0) {
+      lines.push("Messages the streamer marked as bad picks:");
+      for (const text of fbSummary.recentDownTexts) {
+        lines.push(`  - "${text}"`);
+      }
+    }
+    lines.push("Use these feedback patterns to refine the profile.");
+    userPrompt += "\n" + lines.join("\n");
+  }
   const response = await fetch("https://api.openai.com/v1/chat/completions", {
     method: "POST",
     headers: {

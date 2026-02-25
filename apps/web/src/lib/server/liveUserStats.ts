@@ -74,11 +74,27 @@ export function readUserLiveMetricStats(input: {
   bucketMinutes?: number;
 }): UserLiveMetricStats {
   const db = getDb();
-  const windowHours = Math.max(1, Math.min(168, Math.floor(input.windowHours ?? 24)));
-  const bucketMinutes = Math.max(5, Math.min(180, Math.floor(input.bucketMinutes ?? 60)));
+  const requestedWindowHours = Math.max(0, Math.floor(input.windowHours ?? 24));
+  const bucketMinutes = Math.max(5, Math.min(1440, Math.floor(input.bucketMinutes ?? 60)));
   const nowMs = Date.now();
   const bucketMs = bucketMinutes * 60_000;
-  const rawWindowStartMs = nowMs - windowHours * 60 * 60_000;
+
+  let rawWindowStartMs: number;
+  let windowHours: number;
+
+  if (requestedWindowHours === 0) {
+    // All-time: find the earliest event for this user
+    const earliest = db
+      .prepare(`SELECT MIN(ts_ms) AS min_ts FROM user_live_metric_events WHERE user_id = ?`)
+      .get(input.userId) as { min_ts: number | null } | undefined;
+    const minTs = Number(earliest?.min_ts ?? nowMs);
+    rawWindowStartMs = Number.isFinite(minTs) && minTs < nowMs ? minTs : nowMs - 24 * 60 * 60_000;
+    windowHours = Math.max(1, Math.ceil((nowMs - rawWindowStartMs) / (60 * 60_000)));
+  } else {
+    windowHours = Math.min(8760, requestedWindowHours);
+    rawWindowStartMs = nowMs - windowHours * 60 * 60_000;
+  }
+
   const windowStartMs = Math.floor(rawWindowStartMs / bucketMs) * bucketMs;
   const bucketCount = Math.max(1, Math.ceil((nowMs - windowStartMs) / bucketMs));
 

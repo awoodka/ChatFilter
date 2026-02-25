@@ -11,7 +11,8 @@ import { createJudgeRateLimiter, scoreWithRetries } from "@/lib/server/judge";
 import { LiveContext, upsertLiveContext } from "@/lib/server/liveContext";
 import { recordUserLiveMetricDeltas } from "@/lib/server/liveUserStats";
 import { getEvalServerConfig } from "@/lib/server/evalConfig";
-import { buildHighlightUserPrompt, deriveVibeFromLongTerm } from "@/lib/server/highlightPrompt";
+import { buildHighlightUserPrompt, deriveVibeFromLongTerm, FeedbackExample } from "@/lib/server/highlightPrompt";
+import { getUserFeedbackExamples } from "@/lib/server/userFeedback";
 import { dataRootDir } from "@/lib/vod";
 
 type LiveStartRequest = {
@@ -20,6 +21,8 @@ type LiveStartRequest = {
   channelOrUrl: string;
   currentGame?: string;
   thresholdScoreExclusive: number;
+  dynamicThreshold?: boolean;
+  targetRate?: number;
   longTermCacheText: string;
   bots: string[];
   emotes: string[];
@@ -541,13 +544,202 @@ function isAbortError(err: unknown): boolean {
   return err instanceof Error && (err.name === "AbortError" || err.message === "aborted");
 }
 
+// ---------------------------------------------------------------------------
+// Video analysis helpers (Gemini vision)
+// ---------------------------------------------------------------------------
+
+async function captureFramesFromHls(
+  hlsUrl: string,
+  ffmpegBin: string,
+  frameCount: number = 6,
+  timeoutMs: number = 30_000,
+): Promise<{ frames: Buffer[]; stderr: string; timedOut: boolean; exitCode: number | null }> {
+  return new Promise((resolve) => {
+    const args = [
+      "-hide_banner",
+      "-loglevel", "error",
+      "-i", hlsUrl,
+      "-frames:v", String(frameCount),
+      "-vf", "fps=1/10,scale=1280:-1",
+      "-f", "image2pipe",
+      "-vcodec", "mjpeg",
+      "pipe:1",
+    ];
+    const proc = spawn(ffmpegBin, args, { stdio: ["ignore", "pipe", "pipe"] });
+    const chunks: Buffer[] = [];
+    const stderrChunks: string[] = [];
+    let timedOut = false;
+    let exitCode: number | null = null;
+    proc.stdout.on("data", (chunk: Buffer) => chunks.push(chunk));
+    proc.stderr.on("data", (chunk: Buffer) => stderrChunks.push(chunk.toString()));
+
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      const raw = Buffer.concat(chunks);
+      const frames: Buffer[] = [];
+      let start = -1;
+      for (let i = 0; i < raw.length - 1; i++) {
+        if (raw[i] === 0xff && raw[i + 1] === 0xd8) {
+          if (start >= 0) frames.push(Buffer.from(raw.subarray(start, i)));
+          start = i;
+        }
+      }
+      if (start >= 0) frames.push(Buffer.from(raw.subarray(start)));
+      resolve({ frames, stderr: stderrChunks.join("").trim(), timedOut, exitCode });
+    };
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      try { proc.kill("SIGTERM"); } catch { /* ignore */ }
+      finish();
+    }, timeoutMs);
+
+    proc.on("close", (code) => {
+      clearTimeout(timer);
+      exitCode = code;
+      finish();
+    });
+    proc.on("error", (err) => {
+      stderrChunks.push(`spawn error: ${err.message}`);
+      clearTimeout(timer);
+      finish();
+    });
+  });
+}
+
+type VisionResult = { detectedGame: string; visualContext: string };
+
+type VisionAnalysisResult =
+  | { ok: true; result: VisionResult }
+  | { ok: false; reason: string };
+
+async function analyzeFramesWithGemini(
+  geminiApiKey: string,
+  frames: Buffer[],
+  recentTranscriptLines: string[],
+  currentGameHint: string,
+): Promise<VisionAnalysisResult> {
+  try {
+    const totalBytes = frames.reduce((sum, f) => sum + f.length, 0);
+    const transcriptSnippet = recentTranscriptLines.slice(-5).join("\n") || "(none)";
+    const imageParts = frames.map((buf) => ({
+      inline_data: { mime_type: "image/jpeg", data: buf.toString("base64") },
+    }));
+    const textPart = {
+      text: `Analyze these frames from a live Twitch stream. Provide a brief description of:
+1. What game or activity is being shown (be specific — include the game title if recognizable)
+2. What is happening on screen right now (gameplay, menu, loading, cutscene, just chatting, BRB screen, etc.)
+3. Any notable on-screen events visible (alerts, donation notifications, deaths, victories, boss fights, etc.)
+
+Recent transcript for context: ${transcriptSnippet}
+Current game hint from user: ${currentGameHint || "(not specified)"}
+
+Respond in JSON only: {"detectedGame": "<game name or 'unknown'>", "scene": "<brief scene description>", "events": "<notable events or 'none'>"}`,
+    };
+
+    const res = await fetch(
+      `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=${geminiApiKey}`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          contents: [{ parts: [...imageParts, textPart] }],
+          generationConfig: { temperature: 0.2, maxOutputTokens: 300 },
+        }),
+        signal: AbortSignal.timeout(60_000),
+      },
+    );
+    if (!res.ok) {
+      const errBody = await res.text().catch(() => "");
+      return { ok: false, reason: `gemini api status=${res.status} body=${truncateLine(errBody, 200)} (sent ${frames.length} frames, ${totalBytes} bytes)` };
+    }
+    const body = (await res.json()) as Record<string, unknown>;
+    const candidates = Array.isArray((body as Record<string, unknown>)["candidates"])
+      ? ((body as Record<string, unknown>)["candidates"] as Array<Record<string, unknown>>)
+      : [];
+    if (candidates.length === 0) {
+      const blockReason = typeof body["promptFeedback"] === "object" && body["promptFeedback"] !== null
+        ? JSON.stringify(body["promptFeedback"]).slice(0, 200)
+        : "none";
+      return { ok: false, reason: `gemini returned 0 candidates; promptFeedback=${blockReason} (sent ${frames.length} frames, ${totalBytes} bytes)` };
+    }
+    const first = candidates[0];
+    const content = first && typeof first === "object" && first !== null
+      ? (first as Record<string, unknown>)["content"]
+      : null;
+    const finishReason = first && typeof first === "object" && first !== null
+      ? (first as Record<string, unknown>)["finishReason"]
+      : undefined;
+    const parts = content && typeof content === "object" && content !== null && Array.isArray((content as Record<string, unknown>)["parts"])
+      ? ((content as Record<string, unknown>)["parts"] as Array<Record<string, unknown>>)
+      : [];
+    const rawText = parts.map((p) => (typeof p["text"] === "string" ? p["text"] : "")).join("").trim();
+    if (!rawText) {
+      return { ok: false, reason: `gemini returned empty text; finishReason=${String(finishReason ?? "unknown")} candidates[0]=${truncateLine(JSON.stringify(first), 200)}` };
+    }
+
+    // Try to extract JSON from the response (may be wrapped in markdown code fences)
+    const jsonMatch = rawText.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) {
+      return { ok: true, result: { detectedGame: "unknown", visualContext: rawText.slice(0, 300) } };
+    }
+    try {
+      const parsed = JSON.parse(jsonMatch[0]) as Record<string, unknown>;
+      const detectedGame = typeof parsed["detectedGame"] === "string" ? parsed["detectedGame"] : "unknown";
+      const scene = typeof parsed["scene"] === "string" ? parsed["scene"] : "";
+      const events = typeof parsed["events"] === "string" ? parsed["events"] : "none";
+      const visualContext = `${scene}${events && events !== "none" ? `. ${events}` : ""}`.trim().slice(0, 300);
+      return { ok: true, result: { detectedGame, visualContext: visualContext || rawText.slice(0, 300) } };
+    } catch {
+      return { ok: true, result: { detectedGame: "unknown", visualContext: rawText.slice(0, 300) } };
+    }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    return { ok: false, reason: `exception: ${truncateLine(msg, 200)}` };
+  }
+}
+
 export async function startLiveSession(req: LiveStartRequest): Promise<void> {
   const { sessionId } = req;
   const channel = extractChannel(req.channelOrUrl);
   if (!channel) throw new Error("Invalid channel or stream URL");
   const threshold = Math.max(0, Math.min(100, Number(req.thresholdScoreExclusive)));
+  const dynamicEnabled = req.dynamicThreshold === true;
+  const targetRate = Math.max(0.5, Math.min(30, Number(req.targetRate ?? 2)));
+  const targetIntervalMs = (60_000 / targetRate);
+  let lastHighlightedMs = Date.now();
+  let pendingBest: {
+    row: { ts_ms: number; username: string | null; text: string; relevance: number; humor: number; engagement: number; score: number; reason: string };
+    score: number;
+  } | null = null;
 
   const cfg = await getEvalServerConfig();
+
+  // Feedback examples — refreshed periodically so upvotes/downvotes take effect mid-session
+  const FEEDBACK_REFRESH_MS = 60_000;
+  let feedbackUpvoted: FeedbackExample[] = [];
+  let feedbackDownvoted: FeedbackExample[] = [];
+  let lastFeedbackRefreshMs = 0;
+  function refreshFeedbackExamples() {
+    const now = Date.now();
+    if (now - lastFeedbackRefreshMs < FEEDBACK_REFRESH_MS) return;
+    const examples = getUserFeedbackExamples(req.userId);
+    feedbackUpvoted = examples.upvoted.map((e) => ({
+      messageText: e.messageText,
+      score: e.messageScore,
+      reason: e.messageReason,
+    }));
+    feedbackDownvoted = examples.downvoted.map((e) => ({
+      messageText: e.messageText,
+      score: e.messageScore,
+      reason: e.messageReason,
+    }));
+    lastFeedbackRefreshMs = now;
+  }
+  refreshFeedbackExamples();
+
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) throw new Error("Missing OPENAI_API_KEY env var");
   const apiKeyRequired: string = apiKey;
@@ -693,6 +885,8 @@ export async function startLiveSession(req: LiveStartRequest): Promise<void> {
   const recentScored: Array<{ ts_ms: number; text: string; score: number; reason: string }> = [];
   const inFlightScoring = new Set<Promise<void>>();
   const chatterLastSeenMs = new Map<string, number>();
+  let latestVisualContext: string | undefined;
+  let detectedCurrentGame: string | undefined;
   const counts = {
     seen: 0,
     kept: 0,
@@ -784,7 +978,7 @@ export async function startLiveSession(req: LiveStartRequest): Promise<void> {
     }
     return {
       vibe: deriveVibeFromLongTerm(req.longTermCacheText || cfg.longTermCache || ""),
-      currentGame: String(req.currentGame ?? "").trim(),
+      currentGame: (detectedCurrentGame || String(req.currentGame ?? "")).trim(),
       recentEvents: buildRecentEvents(),
       streamStats: {
         msgsPerMin: Math.round((recentChat.length / 10) * 10) / 10,
@@ -796,6 +990,8 @@ export async function startLiveSession(req: LiveStartRequest): Promise<void> {
         .slice(-5)
         .map((m) => truncateLine(m.text, 220))
         .filter(Boolean),
+      visualContext: latestVisualContext,
+      detectedGame: detectedCurrentGame,
       updatedAtMs: nowMs,
     };
   }
@@ -828,6 +1024,7 @@ export async function startLiveSession(req: LiveStartRequest): Promise<void> {
 
   async function scoreAndEmit(msg: LiveMsg) {
     if (await shouldStop()) return;
+    refreshFeedbackExamples();
     const liveCtx = latestLiveContext ?? buildLiveContext(Date.now());
     const userPrompt = buildHighlightUserPrompt({
       longTermProfileText: req.longTermCacheText || cfg.longTermCache || "(empty)",
@@ -835,7 +1032,10 @@ export async function startLiveSession(req: LiveStartRequest): Promise<void> {
       vibe: liveCtx.vibe || "not specified",
       transcriptLines: transcriptTail.slice(-8),
       recentChatLines: recentChat.slice(-10).map((m) => m.text),
+      visualContext: liveCtx.visualContext,
       candidateMessageText: msg.text,
+      upvotedExamples: feedbackUpvoted,
+      downvotedExamples: feedbackDownvoted,
     });
     const res = await scoreWithRetries({
       apiKey: apiKeyRequired,
@@ -872,6 +1072,20 @@ export async function startLiveSession(req: LiveStartRequest): Promise<void> {
     if (res.score > threshold) {
       counts.highlighted += 1;
       await appendJsonl(goodPath, row);
+      lastHighlightedMs = Date.now();
+      pendingBest = null;
+    } else if (dynamicEnabled) {
+      if (!pendingBest || res.score > pendingBest.score) {
+        pendingBest = { row, score: res.score };
+      }
+      const elapsed = Date.now() - lastHighlightedMs;
+      if (elapsed >= targetIntervalMs && pendingBest) {
+        const promoted = { ...pendingBest.row, reason: `[dynamic] ${pendingBest.row.reason ?? ""}`.trim() };
+        counts.highlighted += 1;
+        await appendJsonl(goodPath, promoted);
+        lastHighlightedMs = Date.now();
+        pendingBest = null;
+      }
     }
   }
 
@@ -1099,10 +1313,63 @@ export async function startLiveSession(req: LiveStartRequest): Promise<void> {
     }
   }
 
+  // Video analysis loop (Gemini vision — optional, non-fatal)
+  const geminiApiKey = String(process.env.GEMINI_API_KEY ?? "").trim();
+  const visionIntervalMs = Math.max(10_000, Number(process.env.LIVE_VISION_INTERVAL_MS ?? 60_000));
+  const visionFrameCount = Math.max(1, Math.min(10, Number(process.env.LIVE_VISION_FRAME_COUNT ?? 6)));
+
+  async function videoAnalysisLoop() {
+    if (!geminiApiKey) return;
+    await appendJobLog(sessionId, tsLine(`video analysis enabled interval=${visionIntervalMs}ms frames=${visionFrameCount}`));
+    while (!(await shouldStop())) {
+      try {
+        const capture = await captureFramesFromHls(hlsAudioUrl, ffmpegCmd, visionFrameCount);
+        if (capture.frames.length === 0) {
+          const detail = capture.timedOut
+            ? "ffmpeg timed out"
+            : `ffmpeg exited code=${capture.exitCode}`;
+          const stderrSnippet = capture.stderr ? ` stderr=${truncateLine(capture.stderr, 200)}` : "";
+          await appendJobLog(sessionId, tsLine(`vision: no frames captured (${detail}${stderrSnippet}), will retry next interval`));
+          await sleep(visionIntervalMs);
+          continue;
+        }
+        const frameSizes = capture.frames.map((f) => f.length);
+        await appendJobLog(
+          sessionId,
+          tsLine(`vision: captured ${capture.frames.length} frames (sizes: ${frameSizes.join(", ")} bytes)`),
+        );
+        const gameHint = detectedCurrentGame || String(req.currentGame ?? "").trim();
+        const analysis = await analyzeFramesWithGemini(geminiApiKey, capture.frames, transcriptTail.slice(-5), gameHint);
+        if (analysis.ok) {
+          const result = analysis.result;
+          detectedCurrentGame = result.detectedGame && result.detectedGame !== "unknown" ? result.detectedGame : detectedCurrentGame;
+          latestVisualContext = result.visualContext || latestVisualContext;
+          await appendJobLog(
+            sessionId,
+            tsLine(`vision: game=${truncateLine(detectedCurrentGame ?? "unknown", 60)} context=${truncateLine(result.visualContext, 100)}`),
+          );
+        } else {
+          await appendJobLog(sessionId, tsLine(`vision: analysis failed — ${analysis.reason}`));
+        }
+      } catch (err: unknown) {
+        await appendJobLog(
+          sessionId,
+          tsLine(`vision: iteration error: ${err instanceof Error ? err.message : String(err)}`),
+        );
+      }
+      await sleep(visionIntervalMs);
+    }
+  }
+
+  if (!geminiApiKey) {
+    await appendJobLog(sessionId, tsLine("video analysis disabled: no GEMINI_API_KEY"));
+  }
+
   status.step = "live";
   status.updatedAt = Date.now();
   await writeLiveStatus(status);
 
+  const videoAnalysisPromise = geminiApiKey ? videoAnalysisLoop() : Promise.resolve();
   try {
     await transcribeLoop();
     while (!(await shouldStop())) {
@@ -1115,6 +1382,7 @@ export async function startLiveSession(req: LiveStartRequest): Promise<void> {
     socket.destroy();
     abortScoring();
     await Promise.allSettled(Array.from(inFlightScoring));
+    await videoAnalysisPromise;
     await flushLatest();
     await maybePersistLiveContext(true);
     await maybePersistUserMetricDeltas(true);
@@ -1131,6 +1399,7 @@ export async function startLiveSession(req: LiveStartRequest): Promise<void> {
     socket.destroy();
     abortScoring();
     await Promise.allSettled(Array.from(inFlightScoring));
+    await videoAnalysisPromise;
     await maybePersistLiveContext(true);
     await maybePersistUserMetricDeltas(true);
     const msg = err instanceof Error ? err.message : String(err);

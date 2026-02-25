@@ -87,6 +87,24 @@ function migrate(db: Database.Database): void {
       ON user_live_metric_events(user_id, ts_ms);
     CREATE INDEX IF NOT EXISTS idx_user_live_metric_events_user_session
       ON user_live_metric_events(user_id, session_id);
+
+    CREATE TABLE IF NOT EXISTS user_feedback (
+      id INTEGER PRIMARY KEY AUTOINCREMENT,
+      user_id TEXT NOT NULL,
+      ts_ms INTEGER NOT NULL,
+      message_text TEXT NOT NULL,
+      message_username TEXT,
+      message_score REAL,
+      message_reason TEXT,
+      message_relevance REAL,
+      message_humor REAL,
+      message_engagement REAL,
+      feedback TEXT NOT NULL CHECK(feedback IN ('up', 'down')),
+      session_id TEXT,
+      created_at INTEGER NOT NULL,
+      FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+    );
+    CREATE INDEX IF NOT EXISTS idx_user_feedback_user_created ON user_feedback(user_id, created_at);
   `);
 
   const columns = db.prepare("PRAGMA table_info(user_profiles)").all() as Array<{ name: string }>;

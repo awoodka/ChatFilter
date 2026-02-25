@@ -30,6 +30,8 @@ export type LiveSessionSnapshot = {
   contextText: string;
   currentGame: string;
   threshold: number;
+  dynamicThreshold: boolean;
+  targetRate: number;
   linkedChannelUrl: string;
   updatedAt: number;
 };
@@ -83,6 +85,8 @@ function defaultSnapshot(): LiveSessionSnapshot {
     contextText: "{ }",
     currentGame: "",
     threshold: 80,
+    dynamicThreshold: false,
+    targetRate: 2,
     linkedChannelUrl: "",
     updatedAt: Date.now(),
   };
@@ -118,6 +122,11 @@ export function loadLiveSnapshot(): LiveSessionSnapshot | null {
         typeof parsed["threshold"] === "number" && Number.isFinite(parsed["threshold"])
           ? Math.max(0, Math.min(100, Math.round(parsed["threshold"])))
           : base.threshold,
+      dynamicThreshold: parsed["dynamicThreshold"] === true,
+      targetRate:
+        typeof parsed["targetRate"] === "number" && Number.isFinite(parsed["targetRate"])
+          ? Math.max(0.5, Math.min(30, parsed["targetRate"]))
+          : base.targetRate,
       linkedChannelUrl: typeof parsed["linkedChannelUrl"] === "string" ? parsed["linkedChannelUrl"] : "",
       updatedAt: typeof parsed["updatedAt"] === "number" ? parsed["updatedAt"] : Date.now(),
     };

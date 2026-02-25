@@ -39,6 +39,12 @@ export default function AppNavbar() {
           <div className="twitch-pill hidden md:inline-flex">Realtime chat highlight tooling</div>
         </div>
         <div className="flex items-center gap-2">
+          <Link href="/live" className="twitch-button-secondary inline-flex !h-8 items-center !text-xs">
+            Live MVP
+          </Link>
+          <Link href="/practice" className="twitch-button-secondary inline-flex !h-8 items-center !text-xs">
+            Practice Chat
+          </Link>
           <Link href="/settings" className="twitch-button-secondary inline-flex !h-8 items-center !text-xs">
             Settings
           </Link>

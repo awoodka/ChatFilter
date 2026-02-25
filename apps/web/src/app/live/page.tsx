@@ -18,8 +18,9 @@ function isRecord(x: unknown): x is Record<string, unknown> {
 export default function LivePage() {
   const searchParams = useSearchParams();
   const [linkedChannelUrl, setLinkedChannelUrl] = useState("");
-  const [currentGame, setCurrentGame] = useState("");
   const [threshold, setThreshold] = useState(80);
+  const [dynamicThreshold, setDynamicThreshold] = useState(false);
+  const [targetRate, setTargetRate] = useState(2);
 
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [status, setStatus] = useState<LiveStatus | null>(null);
@@ -108,8 +109,9 @@ export default function LivePage() {
     const timer = window.setTimeout(() => {
       if (snap) {
         setLinkedChannelUrl(snap.linkedChannelUrl);
-        setCurrentGame(snap.currentGame);
         setThreshold(snap.threshold);
+        setDynamicThreshold(snap.dynamicThreshold);
+        setTargetRate(snap.targetRate);
         setSessionId(snap.sessionId);
         setStatus(snap.status);
         setIsRunning(snap.isRunning);
@@ -137,8 +139,9 @@ export default function LivePage() {
     if (!hasRestoredSnapshot) return;
     saveLiveSnapshotPatch({
       linkedChannelUrl,
-      currentGame,
       threshold,
+      dynamicThreshold,
+      targetRate,
       sessionId,
       status,
       isRunning,
@@ -151,8 +154,9 @@ export default function LivePage() {
     });
   }, [
     linkedChannelUrl,
-    currentGame,
     threshold,
+    dynamicThreshold,
+    targetRate,
     sessionId,
     status,
     isRunning,
@@ -200,16 +204,7 @@ export default function LivePage() {
           <div className="twitch-muted mt-2 text-xs">
             IRC login is locked to anonymous mode for this MVP.
           </div>
-          <div className="mt-3 grid gap-3 sm:grid-cols-2 sm:items-end">
-            <div>
-              <label className="twitch-muted text-xs font-medium">Current game (context hint)</label>
-              <input
-                value={currentGame}
-                onChange={(e) => setCurrentGame(e.target.value)}
-                placeholder="Marvel Rivals / League / Just Chatting"
-                className="twitch-input mt-1"
-              />
-            </div>
+          <div className="mt-3 grid gap-3 sm:grid-cols-[1fr_auto]">
             <div>
               <div className="flex items-center justify-between">
                 <label className="twitch-muted text-xs font-medium">Highlight threshold</label>
@@ -222,13 +217,44 @@ export default function LivePage() {
                   min={0}
                   max={100}
                   step={1}
+                  disabled={dynamicThreshold}
                   onChange={(e) => setThreshold(Math.max(0, Math.min(100, Number(e.target.value || "80"))))}
                   style={thresholdSliderStyle}
-                  className="twitch-slider"
+                  className={`twitch-slider${dynamicThreshold ? " opacity-40 cursor-not-allowed" : ""}`}
                 />
               </div>
             </div>
+            <div className="flex flex-col justify-end">
+              <div className="flex h-10 items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setDynamicThreshold((v) => !v)}
+                className={`rounded-full border px-3 py-1 text-xs font-medium whitespace-nowrap transition-colors ${
+                  dynamicThreshold
+                    ? "border-emerald-400/40 bg-emerald-500/10 text-emerald-300"
+                    : "border-[var(--border)] bg-[#121217] text-zinc-400"
+                }`}
+              >
+                {dynamicThreshold ? "Dynamic on" : "Dynamic off"}
+              </button>
+              {dynamicThreshold ? (
+                <div className="flex items-center gap-1.5">
+                  <input
+                    type="number"
+                    value={targetRate}
+                    min={0.5}
+                    max={30}
+                    step={0.5}
+                    onChange={(e) => setTargetRate(Math.max(0.5, Math.min(30, Number(e.target.value) || 2)))}
+                    className="twitch-input w-14 text-center text-xs"
+                  />
+                  <span className="twitch-muted text-xs whitespace-nowrap">msg/min</span>
+                </div>
+              ) : null}
+              </div>
+            </div>
           </div>
+
           <div className="twitch-muted mt-2 text-[11px]">
             Stream channel is loaded from your profile settings:{" "}
             {linkedChannelUrl ? <span className="font-medium text-zinc-200">{linkedChannelUrl}</span> : "(not configured)"}
@@ -258,8 +284,9 @@ export default function LivePage() {
                     method: "POST",
                     headers: { "content-type": "application/json" },
                     body: JSON.stringify({
-                      currentGame: currentGame.trim(),
                       thresholdScoreExclusive: threshold,
+                      dynamicThreshold,
+                      targetRate,
                     }),
                   });
                   const j = (await r.json()) as unknown;

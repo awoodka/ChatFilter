@@ -27,8 +27,6 @@ const QUESTION_DEFS: Array<{ key: StreamQuestionKey; prompt: string }> = [
   },
 ];
 
-const GOOD_CHAT_EXAMPLES_HEADER = "Good chat examples:";
-
 function isRecord(x: unknown): x is Record<string, unknown> {
   return typeof x === "object" && x !== null;
 }
@@ -43,9 +41,9 @@ function toStringRecord(value: unknown): Record<string, string> {
   return out;
 }
 
-function findGoodChatSectionRange(longTermCache: string): { start: number; end: number } | null {
+function findSectionRange(longTermCache: string, header: string): { start: number; end: number } | null {
   const lines = longTermCache.split("\n");
-  const start = lines.findIndex((line) => line.trim().toLowerCase() === GOOD_CHAT_EXAMPLES_HEADER.toLowerCase());
+  const start = lines.findIndex((line) => line.trim().toLowerCase() === header.toLowerCase());
   if (start < 0) return null;
   let end = lines.length;
   for (let i = start + 1; i < lines.length; i += 1) {
@@ -59,8 +57,8 @@ function findGoodChatSectionRange(longTermCache: string): { start: number; end: 
   return { start, end };
 }
 
-function extractGoodChatExamples(longTermCache: string): string {
-  const range = findGoodChatSectionRange(longTermCache);
+function extractSectionExamples(longTermCache: string, header: string): string {
+  const range = findSectionRange(longTermCache, header);
   if (!range) return "";
   const lines = longTermCache.split("\n").slice(range.start + 1, range.end);
   return lines
@@ -70,14 +68,14 @@ function extractGoodChatExamples(longTermCache: string): string {
     .join("\n");
 }
 
-function upsertGoodChatExamples(longTermCache: string, examplesText: string): string {
+function upsertSectionExamples(longTermCache: string, header: string, examplesText: string): string {
   const examples = examplesText
     .split("\n")
     .map((line) => line.trim())
     .filter(Boolean);
-  const sectionLines = [GOOD_CHAT_EXAMPLES_HEADER, ...examples.map((line) => `- ${line}`)];
+  const sectionLines = [header, ...examples.map((line) => `- ${line}`)];
   const lines = longTermCache.split("\n");
-  const range = findGoodChatSectionRange(longTermCache);
+  const range = findSectionRange(longTermCache, header);
 
   if (range) {
     const before = lines.slice(0, range.start);
@@ -94,10 +92,14 @@ function upsertGoodChatExamples(longTermCache: string, examplesText: string): st
   return `${trimmed}\n\n${sectionLines.join("\n")}`.trim();
 }
 
+const GOOD_HEADER = "Good chat examples:";
+const BAD_HEADER = "Bad chat examples:";
+
 export default function StreamSettingsPage() {
   const [questionnaire, setQuestionnaire] = useState<Record<string, string>>({});
   const [longTermCache, setLongTermCache] = useState("");
   const [goodChatExamples, setGoodChatExamples] = useState("");
+  const [badChatExamples, setBadChatExamples] = useState("");
   const [isLoading, setIsLoading] = useState(true);
   const [isSaving, setIsSaving] = useState(false);
   const [isGenerating, setIsGenerating] = useState(false);
@@ -128,7 +130,8 @@ export default function StreamSettingsPage() {
       const profile = j["profile"];
       if (typeof profile["longTermCache"] === "string") {
         setLongTermCache(profile["longTermCache"]);
-        setGoodChatExamples(extractGoodChatExamples(profile["longTermCache"]));
+        setGoodChatExamples(extractSectionExamples(profile["longTermCache"], GOOD_HEADER));
+        setBadChatExamples(extractSectionExamples(profile["longTermCache"], BAD_HEADER));
       }
       setQuestionnaire(toStringRecord(profile["streamQuestionnaire"]));
       setSuccessText(success);
@@ -153,7 +156,8 @@ export default function StreamSettingsPage() {
         setQuestionnaire(toStringRecord(profile["streamQuestionnaire"]));
         if (typeof profile["longTermCache"] === "string") {
           setLongTermCache(profile["longTermCache"]);
-          setGoodChatExamples(extractGoodChatExamples(profile["longTermCache"]));
+          setGoodChatExamples(extractSectionExamples(profile["longTermCache"], GOOD_HEADER));
+          setBadChatExamples(extractSectionExamples(profile["longTermCache"], BAD_HEADER));
         }
       } catch {
         // ignore
@@ -211,9 +215,29 @@ export default function StreamSettingsPage() {
               disabled={isLoading || isSaving || isGenerating}
               onChange={(e) => setGoodChatExamples(e.target.value)}
               onBlur={() => {
-                const nextLongTermCache = upsertGoodChatExamples(longTermCache, goodChatExamples);
+                const nextLongTermCache = upsertSectionExamples(longTermCache, GOOD_HEADER, goodChatExamples);
                 setLongTermCache(nextLongTermCache);
                 void persistProfile({ longTermCache: nextLongTermCache }, "Good chat examples updated.");
+              }}
+            />
+          </div>
+          <div className="space-y-1.5">
+            <label className="text-sm font-medium" htmlFor="bad_chat_examples">
+              Bad chat examples
+            </label>
+            <p className="twitch-muted text-xs">
+              One message per line. Messages the scoring system should avoid highlighting. Updated automatically when you downvote on the highlights page.
+            </p>
+            <textarea
+              id="bad_chat_examples"
+              className="twitch-input min-h-28"
+              value={badChatExamples}
+              disabled={isLoading || isSaving || isGenerating}
+              onChange={(e) => setBadChatExamples(e.target.value)}
+              onBlur={() => {
+                const nextLongTermCache = upsertSectionExamples(longTermCache, BAD_HEADER, badChatExamples);
+                setLongTermCache(nextLongTermCache);
+                void persistProfile({ longTermCache: nextLongTermCache }, "Bad chat examples updated.");
               }}
             />
           </div>
@@ -244,7 +268,8 @@ export default function StreamSettingsPage() {
                   return;
                 }
                 setLongTermCache(j["generated"]);
-                setGoodChatExamples(extractGoodChatExamples(j["generated"]));
+                setGoodChatExamples(extractSectionExamples(j["generated"], GOOD_HEADER));
+                setBadChatExamples(extractSectionExamples(j["generated"], BAD_HEADER));
                 setSuccessText("Generated new profile.");
               } catch (err: unknown) {
                 setErrorText(err instanceof Error ? err.message : String(err));
@@ -266,7 +291,8 @@ export default function StreamSettingsPage() {
           onChange={(e) => setLongTermCache(e.target.value)}
           onBlur={() => {
             const normalized = longTermCache;
-            setGoodChatExamples(extractGoodChatExamples(normalized));
+            setGoodChatExamples(extractSectionExamples(normalized, GOOD_HEADER));
+            setBadChatExamples(extractSectionExamples(normalized, BAD_HEADER));
             void persistProfile({ longTermCache: normalized }, "Long-term profile updated.");
           }}
         />

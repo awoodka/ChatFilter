@@ -10,6 +10,8 @@ export const runtime = "nodejs";
 type LiveStartBody = {
   currentGame?: string;
   thresholdScoreExclusive?: number;
+  dynamicThreshold?: boolean;
+  targetRate?: number;
 };
 
 function jsonError(message: string, status = 400) {
@@ -54,6 +56,8 @@ export async function POST(req: Request) {
         channelOrUrl,
         currentGame,
         thresholdScoreExclusive: Number.isFinite(threshold) ? threshold : 80,
+        dynamicThreshold: body.dynamicThreshold === true,
+        targetRate: Number(body.targetRate ?? 2),
         longTermCacheText: profile.longTermCache,
         bots: profile.bots,
         emotes: profile.emotes,

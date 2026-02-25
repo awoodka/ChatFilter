@@ -78,8 +78,19 @@ function formatCount(value: number): string {
   return Math.max(0, Math.floor(value)).toLocaleString();
 }
 
-function formatBucketLabel(tsMs: number): string {
-  return new Date(tsMs).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+type TimeRange = "24h" | "7d" | "all";
+
+const TIME_RANGE_CONFIG: Record<TimeRange, { windowHours: number; bucketMinutes: number; label: string }> = {
+  "24h": { windowHours: 24, bucketMinutes: 60, label: "24h" },
+  "7d": { windowHours: 168, bucketMinutes: 360, label: "7d" },
+  "all": { windowHours: 0, bucketMinutes: 1440, label: "All" },
+};
+
+function formatBucketLabel(tsMs: number, range: TimeRange): string {
+  const d = new Date(tsMs);
+  if (range === "24h") return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  if (range === "7d") return d.toLocaleDateString([], { month: "short", day: "numeric" });
+  return d.toLocaleDateString([], { month: "short", day: "numeric" });
 }
 
 function buildPolylinePoints(timeline: TimelinePoint[], key: "seen" | "filtered" | "highlighted", maxY: number): string {
@@ -101,7 +112,7 @@ function buildPolylinePoints(timeline: TimelinePoint[], key: "seen" | "filtered"
     .join(" ");
 }
 
-function TimelineGraph({ timeline }: { timeline: TimelinePoint[] }) {
+function TimelineGraph({ timeline, range }: { timeline: TimelinePoint[]; range: TimeRange }) {
   const maxY = Math.max(1, ...timeline.map((p) => Math.max(p.seen, p.filtered, p.highlighted)));
   const viewWidth = 840;
   const viewHeight = 250;
@@ -173,17 +184,17 @@ function TimelineGraph({ timeline }: { timeline: TimelinePoint[] }) {
 
         {first ? (
           <text x={padLeft} y={viewHeight - 10} textAnchor="start" fill="#9ca3af" fontSize="10">
-            {formatBucketLabel(first.tsMs)}
+            {formatBucketLabel(first.tsMs, range)}
           </text>
         ) : null}
         {middle ? (
           <text x={padLeft + innerWidth / 2} y={viewHeight - 10} textAnchor="middle" fill="#9ca3af" fontSize="10">
-            {formatBucketLabel(middle.tsMs)}
+            {formatBucketLabel(middle.tsMs, range)}
           </text>
         ) : null}
         {last ? (
           <text x={padLeft + innerWidth} y={viewHeight - 10} textAnchor="end" fill="#9ca3af" fontSize="10">
-            {formatBucketLabel(last.tsMs)}
+            {formatBucketLabel(last.tsMs, range)}
           </text>
         ) : null}
       </svg>
@@ -249,6 +260,7 @@ export default function Home() {
   const [stats, setStats] = useState<LiveStatsResponse | null>(null);
   const [statsLoading, setStatsLoading] = useState(true);
   const [statsError, setStatsError] = useState<string | null>(null);
+  const [timeRange, setTimeRange] = useState<TimeRange>("24h");
 
   useEffect(() => {
     let cancelled = false;
@@ -304,10 +316,15 @@ export default function Home() {
 
   useEffect(() => {
     let cancelled = false;
+    setStatsLoading(true);
 
+    const cfg = TIME_RANGE_CONFIG[timeRange];
     const refreshStats = async () => {
       try {
-        const r = await fetch("/api/home/live-stats?windowHours=24&bucketMinutes=60", { cache: "no-store" });
+        const r = await fetch(
+          `/api/home/live-stats?windowHours=${cfg.windowHours}&bucketMinutes=${cfg.bucketMinutes}`,
+          { cache: "no-store" },
+        );
         const j = (await r.json()) as unknown;
         if (!isLiveStatsResponse(j)) {
           const message = isRecord(j) && typeof j["error"] === "string" ? j["error"] : "Failed to load live stats.";
@@ -334,7 +351,7 @@ export default function Home() {
       cancelled = true;
       window.clearInterval(id);
     };
-  }, []);
+  }, [timeRange]);
 
   return (
     <div className="twitch-page">
@@ -413,8 +430,27 @@ export default function Home() {
 
               <div className="mt-4 grid gap-4 lg:grid-cols-[2fr_1fr]">
                 <div className="twitch-card-soft p-3">
-                  <div className="mb-1 text-xs font-medium text-zinc-200">Last {stats.windowHours}h activity</div>
-                  <TimelineGraph timeline={stats.timeline} />
+                  <div className="mb-1 flex items-center justify-between gap-2">
+                    <div className="text-xs font-medium text-zinc-200">
+                      {timeRange === "all" ? "All-time activity" : `Last ${stats.windowHours}h activity`}
+                    </div>
+                    <div className="flex gap-1">
+                      {(Object.keys(TIME_RANGE_CONFIG) as TimeRange[]).map((key) => (
+                        <button
+                          key={key}
+                          onClick={() => setTimeRange(key)}
+                          className={`rounded px-2 py-0.5 text-[11px] font-medium transition-colors ${
+                            timeRange === key
+                              ? "bg-[#9147ff] text-white"
+                              : "bg-[var(--panel)] text-zinc-400 hover:text-zinc-200"
+                          }`}
+                        >
+                          {TIME_RANGE_CONFIG[key].label}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <TimelineGraph timeline={stats.timeline} range={timeRange} />
                 </div>
                 <div className="twitch-card-soft p-3">
                   <div className="mb-2 text-xs font-medium text-zinc-200">Seen message distribution (all-time)</div>
@@ -429,7 +465,7 @@ export default function Home() {
           )}
         </div>
 
-        <div className="mt-6 grid gap-4 sm:grid-cols-1">
+        <div className="mt-6 grid gap-4 sm:grid-cols-2">
           <Link
             href="/eval"
             className="twitch-card block p-5 transition-colors hover:border-[#9147ff]"
@@ -439,6 +475,16 @@ export default function Home() {
               Run offline evals on imported VODs, inspect metrics, and review high-scoring + read-aloud chats.
             </div>
             <div className="mt-3 text-xs twitch-link">Open /eval</div>
+          </Link>
+          <Link
+            href="/practice"
+            className="twitch-card block p-5 transition-colors hover:border-[#9147ff]"
+          >
+            <div className="text-base font-medium">Practice chat</div>
+            <div className="mt-1 text-sm twitch-muted">
+              Generate AI chat messages to practice reacting to during streams.
+            </div>
+            <div className="mt-3 text-xs twitch-link">Open /practice</div>
           </Link>
         </div>
 

@@ -48,6 +48,47 @@ export default function LiveHighlightsPage() {
   const [goodMessages, setGoodMessages] = useState<LiveFeedMessage[]>([]);
   const [errorText, setErrorText] = useState<string | null>(null);
   const [hasRestoredSnapshot, setHasRestoredSnapshot] = useState(false);
+  const [feedbackState, setFeedbackState] = useState<Map<string, "up" | "down">>(new Map());
+
+  const submitFeedback = useCallback(
+    async (msg: LiveFeedMessage, idx: number, direction: "up" | "down") => {
+      const key = `${msg.ts_ms}-${idx}`;
+      setFeedbackState((prev) => new Map(prev).set(key, direction));
+      try {
+        const res = await fetch("/api/live/feedback", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            tsMs: msg.ts_ms,
+            messageText: msg.text,
+            messageUsername: msg.username,
+            messageScore: msg.score,
+            messageReason: msg.reason,
+            messageRelevance: msg.relevance,
+            messageHumor: msg.humor,
+            messageEngagement: msg.engagement,
+            feedback: direction,
+            sessionId,
+          }),
+        });
+        const j = (await res.json()) as unknown;
+        if (!isRecord(j) || j["ok"] !== true) {
+          setFeedbackState((prev) => {
+            const next = new Map(prev);
+            next.delete(key);
+            return next;
+          });
+        }
+      } catch {
+        setFeedbackState((prev) => {
+          const next = new Map(prev);
+          next.delete(key);
+          return next;
+        });
+      }
+    },
+    [sessionId],
+  );
   const chatRef = useRef<HTMLDivElement | null>(null);
   const pollRef = useRef<(sid: string) => Promise<void>>(async () => {});
 
@@ -152,18 +193,42 @@ export default function LiveHighlightsPage() {
               </div>
             ) : (
               <div>
-                {goodMessages.map((m, idx) => (
-                  <div key={`${m.ts_ms}-${idx}`} className="px-2 py-1 text-[14px] leading-6">
-                    <span className="mr-2 text-[11px] text-zinc-500">{formatTime(m.ts_ms)}</span>
-                    <span className="mr-2 font-semibold" style={{ color: colorForName(m.username) }}>
-                      {m.username ?? "unknown"}:
-                    </span>
-                    <span className="text-zinc-100">{m.text}</span>
-                    {typeof m.score === "number" ? (
-                      <span className="ml-2 text-[11px] text-zinc-500">({Math.round(m.score)})</span>
-                    ) : null}
-                  </div>
-                ))}
+                {goodMessages.map((m, idx) => {
+                  const fbKey = `${m.ts_ms}-${idx}`;
+                  const fb = feedbackState.get(fbKey);
+                  return (
+                    <div key={fbKey} className="group flex items-center px-2 py-1 text-[14px] leading-6">
+                      <div className="flex-1 min-w-0">
+                        <span className="mr-2 text-[11px] text-zinc-500">{formatTime(m.ts_ms)}</span>
+                        <span className="mr-2 font-semibold" style={{ color: colorForName(m.username) }}>
+                          {m.username ?? "unknown"}:
+                        </span>
+                        <span className="text-zinc-100">{m.text}</span>
+                        {typeof m.score === "number" ? (
+                          <span className="ml-2 text-[11px] text-zinc-500">({Math.round(m.score)})</span>
+                        ) : null}
+                      </div>
+                      <div className={`ml-2 flex gap-1 shrink-0 ${fb ? "opacity-100" : "opacity-0 group-hover:opacity-100"} transition-opacity`}>
+                        <button
+                          disabled={!!fb}
+                          onClick={() => void submitFeedback(m, idx, "up")}
+                          className={`px-1.5 py-0.5 rounded text-sm ${fb === "up" ? "text-emerald-400" : "text-zinc-500 hover:text-emerald-400"} disabled:cursor-default`}
+                          title="Good pick"
+                        >
+                          {"\u25B2"}
+                        </button>
+                        <button
+                          disabled={!!fb}
+                          onClick={() => void submitFeedback(m, idx, "down")}
+                          className={`px-1.5 py-0.5 rounded text-sm ${fb === "down" ? "text-red-400" : "text-zinc-500 hover:text-red-400"} disabled:cursor-default`}
+                          title="Bad pick"
+                        >
+                          {"\u25BC"}
+                        </button>
+                      </div>
+                    </div>
+                  );
+                })}
               </div>
             )}
           </div>
