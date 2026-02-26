@@ -20,6 +20,9 @@ export default function SettingsLayout({ children }: { children: ReactNode }) {
               <Link className="twitch-link rounded-md px-2 py-1.5 text-sm" href="/settings/stream">
                 Stream
               </Link>
+              <Link className="twitch-link rounded-md px-2 py-1.5 text-sm" href="/settings/feedback">
+                Feedback
+              </Link>
             </nav>
           </aside>
           <section>{children}</section>

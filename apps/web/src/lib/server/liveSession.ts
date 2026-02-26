@@ -56,6 +56,7 @@ type LiveContextDebugFile = {
 type RunnerState = {
   stopRequested: boolean;
   scoreAbortController: AbortController | null;
+  threshold: number;
 };
 
 const LIVE_RUNNERS = new Map<string, RunnerState>();
@@ -351,7 +352,7 @@ async function appendJsonl(p: string, obj: unknown): Promise<void> {
   await fs.appendFile(p, JSON.stringify(obj) + "\n", "utf-8");
 }
 
-async function tailJsonl(p: string, limit: number): Promise<Array<Record<string, unknown>>> {
+export async function tailJsonl(p: string, limit: number): Promise<Array<Record<string, unknown>>> {
   try {
     const txt = await fs.readFile(p, "utf-8");
     const lines = txt.split("\n").filter(Boolean);
@@ -848,7 +849,7 @@ export async function startLiveSession(req: LiveStartRequest): Promise<void> {
   await appendJobLog(sessionId, tsLine(`resolved hls playlist ${truncateLine(hlsAudioUrl, 180)}`));
 
   const scoreAbortController = new AbortController();
-  const runner: RunnerState = { stopRequested: false, scoreAbortController };
+  const runner: RunnerState = { stopRequested: false, scoreAbortController, threshold };
   LIVE_RUNNERS.set(sessionId, runner);
 
   function abortScoring() {
@@ -960,7 +961,7 @@ export async function startLiveSession(req: LiveStartRequest): Promise<void> {
       out.push(line);
     };
     for (const row of recentScored.slice(-16).reverse()) {
-      if (row.score < Math.max(65, threshold - 5)) continue;
+      if (row.score < Math.max(65, runner.threshold - 5)) continue;
       add(`${row.text} (${row.reason || "strong reaction potential"})`);
       if (out.length >= 3) break;
     }
@@ -1069,7 +1070,7 @@ export async function startLiveSession(req: LiveStartRequest): Promise<void> {
       reason: res.reason,
     };
     await appendJsonl(scoredPath, row);
-    if (res.score > threshold) {
+    if (res.score > runner.threshold) {
       counts.highlighted += 1;
       await appendJsonl(goodPath, row);
       lastHighlightedMs = Date.now();
@@ -1381,8 +1382,12 @@ export async function startLiveSession(req: LiveStartRequest): Promise<void> {
     }
     socket.destroy();
     abortScoring();
-    await Promise.allSettled(Array.from(inFlightScoring));
-    await videoAnalysisPromise;
+    const STOP_TIMEOUT = 5_000;
+    const stopTimeout = new Promise((r) => setTimeout(r, STOP_TIMEOUT));
+    await Promise.race([
+      Promise.allSettled(Array.from(inFlightScoring)),
+      stopTimeout,
+    ]);
     await flushLatest();
     await maybePersistLiveContext(true);
     await maybePersistUserMetricDeltas(true);
@@ -1398,8 +1403,12 @@ export async function startLiveSession(req: LiveStartRequest): Promise<void> {
   } catch (err: unknown) {
     socket.destroy();
     abortScoring();
-    await Promise.allSettled(Array.from(inFlightScoring));
-    await videoAnalysisPromise;
+    const ERR_STOP_TIMEOUT = 5_000;
+    const errStopTimeout = new Promise((r) => setTimeout(r, ERR_STOP_TIMEOUT));
+    await Promise.race([
+      Promise.allSettled(Array.from(inFlightScoring)),
+      errStopTimeout,
+    ]);
     await maybePersistLiveContext(true);
     await maybePersistUserMetricDeltas(true);
     const msg = err instanceof Error ? err.message : String(err);
@@ -1434,6 +1443,13 @@ export async function requestStopLiveSession(sessionId: string): Promise<boolean
     // ignore; route still marks status step=stopping
   }
   return Boolean(r);
+}
+
+export function updateLiveSessionThreshold(sessionId: string, newThreshold: number): boolean {
+  const r = LIVE_RUNNERS.get(sessionId);
+  if (!r) return false;
+  r.threshold = newThreshold;
+  return true;
 }
 
 export async function readLiveFeed(sessionId: string): Promise<{ chat: Array<Record<string, unknown>>; good: Array<Record<string, unknown>> }> {

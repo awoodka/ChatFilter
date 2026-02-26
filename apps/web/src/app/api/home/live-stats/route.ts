@@ -4,6 +4,7 @@ import { readUserLiveMetricStats } from "@/lib/server/liveUserStats";
 import { requireAuthUser } from "@/lib/server/routeAuth";
 import {
   computeCalibratedThreshold,
+  getAllScoredFeedback,
   getSessionScoreDistribution,
   getThresholdHistory,
   getUserFeedbackAgreementStats,
@@ -39,5 +40,7 @@ export async function GET(req: Request) {
     ? getSessionScoreDistribution(auth.user.id, scoreSessionId)
     : null;
 
-  return NextResponse.json({ ok: true, ...stats, feedback, calibratedThreshold, thresholdHistory, scoreDistribution });
+  const scoredFeedback = getAllScoredFeedback(auth.user.id);
+
+  return NextResponse.json({ ok: true, ...stats, feedback, calibratedThreshold, thresholdHistory, scoreDistribution, scoredFeedback });
 }

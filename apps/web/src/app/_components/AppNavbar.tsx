@@ -42,6 +42,9 @@ export default function AppNavbar() {
           <Link href="/live" className="twitch-button-secondary inline-flex !h-8 items-center !text-xs">
             Live MVP
           </Link>
+          <Link href="/sessions" className="twitch-button-secondary inline-flex !h-8 items-center !text-xs">
+            Sessions
+          </Link>
           <Link href="/practice" className="twitch-button-secondary inline-flex !h-8 items-center !text-xs">
             Practice Chat
           </Link>

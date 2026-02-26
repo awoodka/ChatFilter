@@ -40,6 +40,24 @@ function formatTime(tsMs: number): string {
   return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
+function playAlertBeep() {
+  try {
+    const ctx = new AudioContext();
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = "sine";
+    osc.frequency.value = 880;
+    gain.gain.value = 0.3;
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start();
+    osc.stop(ctx.currentTime + 0.15);
+    osc.onended = () => ctx.close();
+  } catch {
+    // ignore audio errors
+  }
+}
+
 export default function LiveHighlightsPage() {
   const searchParams = useSearchParams();
   const [sessionId, setSessionId] = useState<string | null>(null);
@@ -54,6 +72,13 @@ export default function LiveHighlightsPage() {
   });
   const [pendingKey, setPendingKey] = useState<string | null>(null);
   const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
+  const [alertEnabled, setAlertEnabled] = useState(false);
+  const [alertThreshold, setAlertThreshold] = useState(90);
+  const [flashKeys, setFlashKeys] = useState<Set<string>>(new Set());
+  const [metrics, setMetrics] = useState<{ seen: number; kept: number; scored: number; highlighted: number; retries429: number } | null>(null);
+  const [rates, setRates] = useState<{ seenPerMin: number; scoredPerMin: number; highlightedPerMin: number } | null>(null);
+  const prevSnapshotRef = useRef<{ counts: { seen: number; kept: number; scored: number; highlighted: number; retries429: number }; tsMs: number } | null>(null);
+  const prevGoodCountRef = useRef<number>(0);
 
   const submitFeedback = useCallback(
     async (msg: LiveFeedMessage, idx: number, direction: "up" | "down") => {
@@ -133,6 +158,17 @@ export default function LiveHighlightsPage() {
       setStatus(s);
       const good = Array.isArray(j["good"]) ? j["good"] : [];
       setGoodMessages(good.map(toLiveFeedMessage).filter((x): x is LiveFeedMessage => Boolean(x)));
+      const rawMetrics = isRecord(j["metrics"]) ? j["metrics"] as Record<string, unknown> : null;
+      const rawCounts = rawMetrics && isRecord(rawMetrics["counts"]) ? rawMetrics["counts"] as Record<string, unknown> : null;
+      if (rawCounts) {
+        setMetrics({
+          seen: Number(rawCounts["seen"] ?? 0),
+          kept: Number(rawCounts["kept"] ?? 0),
+          scored: Number(rawCounts["scored"] ?? 0),
+          highlighted: Number(rawCounts["highlighted"] ?? 0),
+          retries429: Number(rawCounts["retries429"] ?? 0),
+        });
+      }
       if (s.state === "running" || s.state === "queued") {
         setIsRunning(true);
         setTimeout(() => void pollRef.current(sid), 1200);
@@ -227,6 +263,64 @@ export default function LiveHighlightsPage() {
     return () => window.removeEventListener("keydown", handler);
   }, [goodMessages, selectedIndex, submitFeedback]);
 
+  // Alert detection
+  useEffect(() => {
+    if (!alertEnabled) {
+      prevGoodCountRef.current = goodMessages.length;
+      return;
+    }
+    const prevCount = prevGoodCountRef.current;
+    if (goodMessages.length > prevCount) {
+      const newMsgs = goodMessages.slice(prevCount);
+      const alertKeys: string[] = [];
+      for (let i = prevCount; i < goodMessages.length; i++) {
+        const m = goodMessages[i]!;
+        if (typeof m.score === "number" && m.score >= alertThreshold) {
+          alertKeys.push(`${m.ts_ms}-${i}`);
+        }
+      }
+      if (alertKeys.length > 0) {
+        playAlertBeep();
+        setFlashKeys((prev) => {
+          const next = new Set(prev);
+          for (const k of alertKeys) next.add(k);
+          return next;
+        });
+        setTimeout(() => {
+          setFlashKeys((prev) => {
+            const next = new Set(prev);
+            for (const k of alertKeys) next.delete(k);
+            return next;
+          });
+        }, 1500);
+      }
+    }
+    prevGoodCountRef.current = goodMessages.length;
+  }, [goodMessages, alertEnabled, alertThreshold]);
+
+  // Compute per-minute rates from metrics deltas
+  useEffect(() => {
+    if (!metrics) return;
+    const now = Date.now();
+    const prev = prevSnapshotRef.current;
+    if (prev) {
+      const dtSec = (now - prev.tsMs) / 1000;
+      if (dtSec >= 2) {
+        const dSeen = metrics.seen - prev.counts.seen;
+        const dScored = metrics.scored - prev.counts.scored;
+        const dHighlighted = metrics.highlighted - prev.counts.highlighted;
+        setRates({
+          seenPerMin: Math.round((dSeen / dtSec) * 60),
+          scoredPerMin: Math.round((dScored / dtSec) * 60),
+          highlightedPerMin: Math.round((dHighlighted / dtSec) * 60),
+        });
+        prevSnapshotRef.current = { counts: { ...metrics }, tsMs: now };
+      }
+    } else {
+      prevSnapshotRef.current = { counts: { ...metrics }, tsMs: now };
+    }
+  }, [metrics]);
+
   return (
     <div className="twitch-page">
       <div className="twitch-shell max-w-4xl">
@@ -242,12 +336,53 @@ export default function LiveHighlightsPage() {
 
         <div className="twitch-card mt-5 overflow-hidden">
           <div className="border-b border-[var(--border)] bg-[#111118] px-4 py-3">
-            <div className="flex items-center justify-between">
+            <div className="flex items-center justify-between gap-2">
               <div className="text-sm font-semibold uppercase tracking-wide text-zinc-200">Twitch-style highlights feed</div>
-              <div className={`text-xs font-semibold ${isRunning ? "text-emerald-300" : "text-zinc-400"}`}>
-                {status ? `state=${status.state}` : "No active session"}
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setAlertEnabled((v) => !v)}
+                  className={`rounded-full border px-2.5 py-0.5 text-[11px] font-medium transition-colors ${
+                    alertEnabled
+                      ? "border-emerald-400/40 bg-emerald-500/10 text-emerald-300"
+                      : "border-[var(--border)] bg-[#121217] text-zinc-400"
+                  }`}
+                >
+                  {alertEnabled ? "Alerts on" : "Alerts off"}
+                </button>
+                {alertEnabled ? (
+                  <input
+                    type="number"
+                    value={alertThreshold}
+                    min={60}
+                    max={100}
+                    step={1}
+                    onChange={(e) => setAlertThreshold(Math.max(60, Math.min(100, Number(e.target.value) || 90)))}
+                    className="twitch-input w-12 text-center text-[11px] !h-6"
+                    title="Alert score threshold"
+                  />
+                ) : null}
+                <div className={`text-xs font-semibold ${isRunning ? "text-emerald-300" : "text-zinc-400"}`}>
+                  {status ? `state=${status.state}` : "No active session"}
+                </div>
               </div>
             </div>
+            {isRunning && metrics ? (
+              <div className="mt-1.5 space-y-0.5 text-[11px] text-zinc-500">
+                {rates ? (
+                  <div>
+                    Chat: {rates.seenPerMin}/min{" · "}Scored: {rates.scoredPerMin}/min{" · "}Highlights: {rates.highlightedPerMin}/min{" · "}
+                    <span className={metrics.retries429 > 0 ? "text-amber-400" : ""}>429s: {metrics.retries429}</span>
+                    {rates.seenPerMin > 0 && rates.scoredPerMin === 0 ? (
+                      <span className="ml-2 text-amber-400">Scoring paused</span>
+                    ) : null}
+                  </div>
+                ) : null}
+                <div>
+                  Total: {metrics.seen.toLocaleString()} seen{" · "}{metrics.scored.toLocaleString()} scored{" · "}{metrics.highlighted.toLocaleString()} highlighted
+                </div>
+              </div>
+            ) : null}
           </div>
 
           <div
@@ -268,13 +403,16 @@ export default function LiveHighlightsPage() {
                   const fb = feedbackState.get(fbKey);
                   const isSelected = selectedIndex === idx;
                   const isPending = pendingKey === fbKey;
+                  const isFlashing = flashKeys.has(fbKey);
                   return (
                     <div
                       key={fbKey}
                       data-index={idx}
                       onClick={() => setSelectedIndex(idx)}
-                      className={`group flex items-center px-2 py-1 text-[14px] leading-6 cursor-pointer ${
-                        isSelected ? "border-l-2 border-[#9147ff] bg-[#9147ff]/5" : "border-l-2 border-transparent"
+                      className={`group flex items-center px-2 py-1 text-[14px] leading-6 cursor-pointer transition-colors ${
+                        isFlashing
+                          ? "animate-pulse border-l-2 border-emerald-400 bg-emerald-500/10"
+                          : isSelected ? "border-l-2 border-[#9147ff] bg-[#9147ff]/5" : "border-l-2 border-transparent"
                       }`}
                     >
                       <div className="flex-1 min-w-0">
@@ -285,6 +423,14 @@ export default function LiveHighlightsPage() {
                         <span className="text-zinc-100">{m.text}</span>
                         {typeof m.score === "number" ? (
                           <span className="ml-2 text-[11px] text-zinc-500">({Math.round(m.score)})</span>
+                        ) : null}
+                        {isSelected && m.relevance != null && m.humor != null && m.engagement != null ? (
+                          <div className="mt-0.5 text-[11px] text-zinc-500">
+                            <span>Relevance: {Math.round(m.relevance)}</span>
+                            <span className="ml-2">Humor: {Math.round(m.humor)}</span>
+                            <span className="ml-2">Engagement: {Math.round(m.engagement)}</span>
+                            {m.reason ? <span className="ml-2 truncate italic">&ldquo;{m.reason}&rdquo;</span> : null}
+                          </div>
                         ) : null}
                       </div>
                       <div className={`ml-2 flex gap-1 shrink-0 ${fb || isSelected ? "opacity-100" : "opacity-0 group-hover:opacity-100"} transition-opacity`}>

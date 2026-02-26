@@ -34,6 +34,7 @@ export default function LivePage() {
   const [metricsText, setMetricsText] = useState<string>("{ }");
   const [contextText, setContextText] = useState<string>("{ }");
   const [hasRestoredSnapshot, setHasRestoredSnapshot] = useState(false);
+  const thresholdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const goodChatRef = useRef<HTMLDivElement | null>(null);
   const incomingChatRef = useRef<HTMLDivElement | null>(null);
   const logsRef = useRef<HTMLPreElement | null>(null);
@@ -66,7 +67,10 @@ export default function LivePage() {
   }, []);
 
   // Fetch calibrated threshold on mount and pre-populate the slider
+  // Skip overriding if user already has an active session (snapshot preserves their choice)
   useEffect(() => {
+    const snap = loadLiveSnapshot();
+    if (snap?.isRunning) return;
     let cancelled = false;
     (async () => {
       try {
@@ -233,9 +237,7 @@ export default function LivePage() {
               <div className="flex items-center justify-between">
                 <label className="twitch-muted text-xs font-medium">Highlight threshold</label>
                 <div className="flex items-center gap-2">
-                  {isRunning ? (
-                    <span className="text-[10px] text-zinc-500">Locked for current session</span>
-                  ) : calibratedThreshold !== null && threshold === calibratedThreshold ? (
+                  {calibratedThreshold !== null && threshold === calibratedThreshold ? (
                     <span className="text-[10px] text-[#d6bcff]">Auto-calibrated from feedback</span>
                   ) : null}
                   <span className="twitch-muted text-xs">{threshold}</span>
@@ -248,10 +250,23 @@ export default function LivePage() {
                   min={0}
                   max={100}
                   step={1}
-                  disabled={dynamicThreshold || isRunning}
-                  onChange={(e) => setThreshold(Math.max(0, Math.min(100, Number(e.target.value || "80"))))}
+                  disabled={dynamicThreshold}
+                  onChange={(e) => {
+                    const val = Math.max(0, Math.min(100, Number(e.target.value || "80")));
+                    setThreshold(val);
+                    if (isRunning && sessionId) {
+                      if (thresholdTimerRef.current) clearTimeout(thresholdTimerRef.current);
+                      thresholdTimerRef.current = setTimeout(() => {
+                        void fetch("/api/live/threshold", {
+                          method: "POST",
+                          headers: { "Content-Type": "application/json" },
+                          body: JSON.stringify({ sessionId, threshold: val }),
+                        });
+                      }, 300);
+                    }
+                  }}
                   style={thresholdSliderStyle}
-                  className={`twitch-slider${dynamicThreshold || isRunning ? " opacity-40 cursor-not-allowed" : ""}`}
+                  className={`twitch-slider${dynamicThreshold ? " opacity-40 cursor-not-allowed" : ""}`}
                 />
               </div>
             </div>

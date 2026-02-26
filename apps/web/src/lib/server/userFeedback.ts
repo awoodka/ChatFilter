@@ -93,6 +93,31 @@ export function insertUserFeedback(input: InsertInput): UserFeedbackRow {
   return toRow(row);
 }
 
+export function getUserFeedbackPaginated(
+  userId: string,
+  opts?: { limit?: number; offset?: number; sessionId?: string },
+): { rows: UserFeedbackRow[]; total: number } {
+  const db = getDb();
+  const limit = Math.min(100, Math.max(1, opts?.limit ?? 50));
+  const offset = Math.max(0, opts?.offset ?? 0);
+  const sessionId = opts?.sessionId?.trim() || null;
+
+  const whereClause = sessionId
+    ? "WHERE user_id = ? AND session_id = ?"
+    : "WHERE user_id = ?";
+  const params = sessionId ? [userId, sessionId] : [userId];
+
+  const countRow = db
+    .prepare(`SELECT COUNT(*) AS cnt FROM user_feedback ${whereClause}`)
+    .get(...params) as { cnt: number };
+
+  const rows = db
+    .prepare(`SELECT * FROM user_feedback ${whereClause} ORDER BY created_at DESC LIMIT ? OFFSET ?`)
+    .all(...params, limit, offset) as DbRow[];
+
+  return { rows: rows.map(toRow), total: countRow.cnt };
+}
+
 export function getUserFeedbackExamples(
   userId: string,
   opts?: { upLimit?: number; downLimit?: number },
@@ -341,6 +366,18 @@ export function getSessionScoreDistribution(
   }
 
   return { buckets };
+}
+
+export function getAllScoredFeedback(userId: string): Array<{ score: number; feedback: "up" | "down" }> {
+  const db = getDb();
+  const rows = db
+    .prepare(
+      `SELECT message_score, feedback FROM user_feedback
+       WHERE user_id = ? AND message_score IS NOT NULL
+       ORDER BY message_score ASC`,
+    )
+    .all(userId) as Array<{ message_score: number; feedback: string }>;
+  return rows.map((r) => ({ score: r.message_score, feedback: r.feedback as "up" | "down" }));
 }
 
 export function getUserFeedbackSummary(userId: string): {

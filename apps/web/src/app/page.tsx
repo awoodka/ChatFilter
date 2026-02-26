@@ -5,6 +5,12 @@ import { useEffect, useState } from "react";
 
 import { LiveStatus, loadLiveSnapshot, saveLiveSnapshotPatch } from "@/lib/live/sessionSnapshot";
 
+type OnboardingSteps = {
+  hasTwitchChannel: boolean;
+  hasQuestionnaire: boolean;
+  hasProfile: boolean;
+};
+
 type LiveIndicatorState = "checking" | "live" | "idle" | "error";
 type TimelinePoint = {
   tsMs: number;
@@ -53,6 +59,11 @@ type ScoreDistribution = {
   buckets: ScoreBucket[];
 };
 
+type ScoredFeedbackEntry = {
+  score: number;
+  feedback: "up" | "down";
+};
+
 type LiveStatsResponse = {
   ok: true;
   windowHours: number;
@@ -68,6 +79,7 @@ type LiveStatsResponse = {
   calibratedThreshold: number | null;
   thresholdHistory: ThresholdHistoryPoint[];
   scoreDistribution: ScoreDistribution | null;
+  scoredFeedback?: ScoredFeedbackEntry[];
 };
 
 function isRecord(x: unknown): x is Record<string, unknown> {
@@ -128,6 +140,7 @@ function isLiveStatsResponse(x: unknown): x is LiveStatsResponse {
   if (x["calibratedThreshold"] !== null && !isFiniteNumber(x["calibratedThreshold"])) return false;
   if (!Array.isArray(x["thresholdHistory"]) || !x["thresholdHistory"].every(isThresholdHistoryPoint)) return false;
   if (x["scoreDistribution"] !== null && !isScoreDistribution(x["scoreDistribution"])) return false;
+  if (x["scoredFeedback"] !== undefined && !Array.isArray(x["scoredFeedback"])) return false;
   return isFiniteNumber(x["windowHours"]) && isFiniteNumber(x["bucketMinutes"]) && isFiniteNumber(x["windowStartMs"]) && isFiniteNumber(x["windowEndMs"]);
 }
 
@@ -372,6 +385,44 @@ function ThresholdHistoryGraph({ history }: { history: ThresholdHistoryPoint[] }
   );
 }
 
+function FilterFunnel({ totals }: { totals: Totals }) {
+  const steps = [
+    { label: "Seen", value: totals.seen, color: "#60a5fa" },
+    { label: "Filtered", value: totals.filtered, color: "#a78bfa" },
+    { label: "Highlighted", value: totals.highlighted, color: "#34d399" },
+  ];
+  const maxVal = Math.max(1, totals.seen);
+
+  return (
+    <div className="space-y-2">
+      {steps.map((step, idx) => {
+        const prev = idx > 0 ? steps[idx - 1]! : null;
+        const dropPct = prev && prev.value > 0 ? Math.round(((prev.value - step.value) / prev.value) * 100) : null;
+        const widthPct = Math.max(4, (step.value / maxVal) * 100);
+        return (
+          <div key={step.label}>
+            <div className="mb-0.5 flex items-center justify-between text-xs">
+              <span className="text-zinc-200">{step.label}</span>
+              <span className="text-zinc-400">
+                {formatCount(step.value)}
+                {dropPct !== null ? (
+                  <span className="ml-1 text-zinc-500">(-{dropPct}%)</span>
+                ) : null}
+              </span>
+            </div>
+            <div className="h-5 overflow-hidden rounded bg-[#1f1f23]">
+              <div
+                className="h-full rounded transition-all"
+                style={{ width: `${widthPct}%`, background: step.color }}
+              />
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
 function ScoreDistributionChart({ distribution }: { distribution: ScoreDistribution }) {
   const maxCount = Math.max(1, ...distribution.buckets.map((b) => b.upCount + b.downCount));
   const viewWidth = 840;
@@ -436,6 +487,83 @@ function ScoreDistributionChart({ distribution }: { distribution: ScoreDistribut
   );
 }
 
+function ThresholdSimulator({ entries }: { entries: ScoredFeedbackEntry[] }) {
+  const [simThreshold, setSimThreshold] = useState(80);
+  const goodShown = entries.filter((e) => e.score > simThreshold && e.feedback === "up").length;
+  const badShown = entries.filter((e) => e.score > simThreshold && e.feedback === "down").length;
+  const goodMissed = entries.filter((e) => e.score <= simThreshold && e.feedback === "up").length;
+  const badFiltered = entries.filter((e) => e.score <= simThreshold && e.feedback === "down").length;
+
+  return (
+    <div>
+      <div className="mb-3 flex items-center justify-between">
+        <label className="text-xs font-medium text-zinc-200">Simulated threshold</label>
+        <span className="text-xs text-zinc-400">{simThreshold}</span>
+      </div>
+      <input
+        type="range"
+        value={simThreshold}
+        min={60}
+        max={100}
+        step={1}
+        onChange={(e) => setSimThreshold(Number(e.target.value))}
+        className="twitch-slider w-full"
+        style={{ "--slider-fill": `${simThreshold}%` } as React.CSSProperties}
+      />
+      <div className="mt-3 grid grid-cols-2 gap-2">
+        <div className="twitch-card-soft p-2 text-center">
+          <div className="text-lg font-semibold text-emerald-300">{goodShown}</div>
+          <div className="text-[10px] text-zinc-400">Good shown</div>
+        </div>
+        <div className="twitch-card-soft p-2 text-center">
+          <div className="text-lg font-semibold text-red-300">{badShown}</div>
+          <div className="text-[10px] text-zinc-400">Bad shown</div>
+        </div>
+        <div className="twitch-card-soft p-2 text-center">
+          <div className="text-lg font-semibold text-amber-300">{goodMissed}</div>
+          <div className="text-[10px] text-zinc-400">Good missed</div>
+        </div>
+        <div className="twitch-card-soft p-2 text-center">
+          <div className="text-lg font-semibold text-zinc-300">{badFiltered}</div>
+          <div className="text-[10px] text-zinc-400">Bad filtered</div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function OnboardingChecklist({ steps }: { steps: OnboardingSteps }) {
+  if (steps.hasTwitchChannel && steps.hasQuestionnaire && steps.hasProfile) return null;
+  const items = [
+    { done: steps.hasTwitchChannel, label: "Link Twitch channel", href: "/settings/profile" },
+    { done: steps.hasQuestionnaire, label: "Answer stream questions", href: "/settings/stream" },
+    { done: steps.hasProfile, label: "Generate AI profile", href: "/settings/stream" },
+  ];
+  return (
+    <div className="twitch-card mt-4 border-[#9147ff]/30 p-4">
+      <div className="mb-2 text-sm font-medium">Get started</div>
+      <div className="space-y-1.5">
+        {items.map((item) => (
+          <Link
+            key={item.label}
+            href={item.href}
+            className={`flex items-center gap-2 rounded px-1 py-0.5 text-sm transition-colors hover:bg-[#1f1f23] ${
+              item.done ? "text-zinc-500 line-through" : "text-zinc-200"
+            }`}
+          >
+            <span className={`inline-block h-4 w-4 rounded-full border-2 text-center text-[10px] leading-3 ${
+              item.done ? "border-emerald-400 bg-emerald-400/20 text-emerald-400" : "border-zinc-600"
+            }`}>
+              {item.done ? "\u2713" : ""}
+            </span>
+            {item.label}
+          </Link>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 export default function Home() {
   const [liveIndicator, setLiveIndicator] = useState<LiveIndicatorState>("checking");
   const [liveSessionId, setLiveSessionId] = useState<string | null>(null);
@@ -444,6 +572,28 @@ export default function Home() {
   const [statsError, setStatsError] = useState<string | null>(null);
   const [timeRange, setTimeRange] = useState<TimeRange>("24h");
   const [selectedScoreSession, setSelectedScoreSession] = useState<string | null>(null);
+  const [onboarding, setOnboarding] = useState<OnboardingSteps | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await fetch("/api/onboarding/status", { cache: "no-store" });
+        const j = (await r.json()) as unknown;
+        if (!cancelled && isRecord(j) && j["ok"] === true && isRecord(j["steps"])) {
+          const s = j["steps"] as Record<string, unknown>;
+          setOnboarding({
+            hasTwitchChannel: s["hasTwitchChannel"] === true,
+            hasQuestionnaire: s["hasQuestionnaire"] === true,
+            hasProfile: s["hasProfile"] === true,
+          });
+        }
+      } catch {
+        // ignore
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -541,6 +691,8 @@ export default function Home() {
         <div className="flex items-baseline justify-between gap-4">
           <h1 className="text-2xl font-semibold tracking-tight">ChatFilter</h1>
         </div>
+
+        {onboarding ? <OnboardingChecklist steps={onboarding} /> : null}
 
         <div className="twitch-card mt-4 p-4">
           <div className="flex items-center justify-between gap-3">
@@ -644,6 +796,11 @@ export default function Home() {
                 </div>
               </div>
 
+              <div className="twitch-card-soft mt-4 p-3">
+                <div className="mb-2 text-xs font-medium text-zinc-200">Filter funnel (all-time)</div>
+                <FilterFunnel totals={stats.totals.allTime} />
+              </div>
+
               <div className="mt-4 grid gap-4 lg:grid-cols-[2fr_1fr]">
                 <div className="twitch-card-soft p-3">
                   <div className="mb-1 flex items-center justify-between gap-2">
@@ -713,6 +870,13 @@ export default function Home() {
                     <ScoreDistributionChart distribution={stats.scoreDistribution} />
                   ) : null}
                   <ThresholdHistoryGraph history={stats.thresholdHistory} />
+                </div>
+              ) : null}
+
+              {stats.scoredFeedback && stats.scoredFeedback.length >= 5 ? (
+                <div className="mt-4 twitch-card-soft p-3">
+                  <div className="mb-2 text-xs font-medium text-zinc-200">Threshold simulator</div>
+                  <ThresholdSimulator entries={stats.scoredFeedback} />
                 </div>
               ) : null}
             </>
