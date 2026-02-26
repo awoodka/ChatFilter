@@ -191,6 +191,158 @@ export function pushBadChatExample(userId: string, messageText: string): void {
   pushChatExample(userId, messageText, "Bad chat examples:");
 }
 
+export function getUserFeedbackAgreementStats(userId: string): {
+  totalUp: number;
+  totalDown: number;
+  total: number;
+  agreementRate: number | null;
+  recentSessions: Array<{
+    sessionId: string;
+    up: number;
+    down: number;
+    rate: number;
+    lastFeedbackAt: number;
+  }>;
+} {
+  const db = getDb();
+
+  const counts = db
+    .prepare(
+      `SELECT feedback, COUNT(*) AS cnt FROM user_feedback
+       WHERE user_id = ? GROUP BY feedback`,
+    )
+    .all(userId) as Array<{ feedback: string; cnt: number }>;
+
+  const totalUp = counts.find((c) => c.feedback === "up")?.cnt ?? 0;
+  const totalDown = counts.find((c) => c.feedback === "down")?.cnt ?? 0;
+  const total = totalUp + totalDown;
+  const agreementRate = total > 0 ? totalUp / total : null;
+
+  const sessionRows = db
+    .prepare(
+      `SELECT session_id,
+              SUM(CASE WHEN feedback = 'up' THEN 1 ELSE 0 END) AS up,
+              SUM(CASE WHEN feedback = 'down' THEN 1 ELSE 0 END) AS down,
+              MAX(created_at) AS last_feedback_at
+       FROM user_feedback
+       WHERE user_id = ? AND session_id IS NOT NULL
+       GROUP BY session_id
+       ORDER BY last_feedback_at DESC
+       LIMIT 10`,
+    )
+    .all(userId) as Array<{ session_id: string; up: number; down: number; last_feedback_at: number }>;
+
+  const recentSessions = sessionRows.map((r) => ({
+    sessionId: r.session_id,
+    up: r.up,
+    down: r.down,
+    rate: r.up + r.down > 0 ? r.up / (r.up + r.down) : 0,
+    lastFeedbackAt: r.last_feedback_at,
+  }));
+
+  return { totalUp, totalDown, total, agreementRate, recentSessions };
+}
+
+export function computeCalibratedThreshold(userId: string): number | null {
+  const db = getDb();
+  const rows = db
+    .prepare(
+      `SELECT message_score, feedback FROM user_feedback
+       WHERE user_id = ? AND message_score IS NOT NULL
+       ORDER BY created_at DESC LIMIT 100`,
+    )
+    .all(userId) as Array<{ message_score: number; feedback: string }>;
+
+  if (rows.length < 5) return null;
+
+  const upScores = rows.filter((r) => r.feedback === "up").map((r) => r.message_score);
+  const downScores = rows.filter((r) => r.feedback === "down").map((r) => r.message_score);
+
+  if (downScores.length === 0) return null;
+
+  const mean = (arr: number[]) => arr.reduce((a, b) => a + b, 0) / arr.length;
+  const meanUp = upScores.length > 0 ? mean(upScores) : mean(downScores);
+  const meanDown = mean(downScores);
+  const calibrated = meanDown + 0.5 * (meanUp - meanDown);
+  return Math.round(Math.min(95, Math.max(60, calibrated)));
+}
+
+export function getThresholdHistory(
+  userId: string,
+): Array<{ sessionId: string; threshold: number | null; lastFeedbackAt: number }> {
+  const db = getDb();
+
+  // Get distinct sessions ordered by their last feedback time
+  const sessions = db
+    .prepare(
+      `SELECT session_id, MAX(created_at) AS last_feedback_at
+       FROM user_feedback
+       WHERE user_id = ? AND session_id IS NOT NULL AND message_score IS NOT NULL
+       GROUP BY session_id
+       ORDER BY last_feedback_at ASC`,
+    )
+    .all(userId) as Array<{ session_id: string; last_feedback_at: number }>;
+
+  // For each session, compute cumulative calibrated threshold using all feedback up to that session
+  return sessions.map((s) => {
+    const rows = db
+      .prepare(
+        `SELECT message_score, feedback FROM user_feedback
+         WHERE user_id = ? AND message_score IS NOT NULL AND created_at <= ?
+         ORDER BY created_at DESC LIMIT 100`,
+      )
+      .all(userId, s.last_feedback_at) as Array<{ message_score: number; feedback: string }>;
+
+    let threshold: number | null = null;
+    if (rows.length >= 5) {
+      const upScores = rows.filter((r) => r.feedback === "up").map((r) => r.message_score);
+      const downScores = rows.filter((r) => r.feedback === "down").map((r) => r.message_score);
+      if (downScores.length > 0) {
+        const mean = (arr: number[]) => arr.reduce((a, b) => a + b, 0) / arr.length;
+        const meanUp = upScores.length > 0 ? mean(upScores) : mean(downScores);
+        const meanDown = mean(downScores);
+        const calibrated = meanDown + 0.5 * (meanUp - meanDown);
+        threshold = Math.round(Math.min(95, Math.max(60, calibrated)));
+      }
+    }
+
+    return { sessionId: s.session_id, threshold, lastFeedbackAt: s.last_feedback_at };
+  });
+}
+
+export function getSessionScoreDistribution(
+  userId: string,
+  sessionId: string,
+): { buckets: Array<{ rangeStart: number; upCount: number; downCount: number }> } {
+  const db = getDb();
+  const rows = db
+    .prepare(
+      `SELECT message_score, feedback FROM user_feedback
+       WHERE user_id = ? AND session_id = ? AND message_score IS NOT NULL`,
+    )
+    .all(userId, sessionId) as Array<{ message_score: number; feedback: string }>;
+
+  // Create 5-point bins from 60 to 100
+  const bucketStarts = [60, 65, 70, 75, 80, 85, 90, 95];
+  const buckets = bucketStarts.map((rangeStart) => ({ rangeStart, upCount: 0, downCount: 0 }));
+
+  for (const r of rows) {
+    const score = r.message_score;
+    // Find the appropriate bucket
+    let bucketIdx = bucketStarts.length - 1;
+    for (let i = 0; i < bucketStarts.length - 1; i++) {
+      if (score < bucketStarts[i + 1]!) {
+        bucketIdx = i;
+        break;
+      }
+    }
+    if (r.feedback === "up") buckets[bucketIdx]!.upCount++;
+    else buckets[bucketIdx]!.downCount++;
+  }
+
+  return { buckets };
+}
+
 export function getUserFeedbackSummary(userId: string): {
   totalUp: number;
   totalDown: number;

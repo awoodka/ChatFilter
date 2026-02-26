@@ -21,6 +21,38 @@ type Totals = {
   filteredOnly: number;
 };
 
+type FeedbackSession = {
+  sessionId: string;
+  up: number;
+  down: number;
+  rate: number;
+  lastFeedbackAt: number;
+};
+
+type FeedbackStats = {
+  totalUp: number;
+  totalDown: number;
+  total: number;
+  agreementRate: number | null;
+  recentSessions: FeedbackSession[];
+};
+
+type ThresholdHistoryPoint = {
+  sessionId: string;
+  threshold: number | null;
+  lastFeedbackAt: number;
+};
+
+type ScoreBucket = {
+  rangeStart: number;
+  upCount: number;
+  downCount: number;
+};
+
+type ScoreDistribution = {
+  buckets: ScoreBucket[];
+};
+
 type LiveStatsResponse = {
   ok: true;
   windowHours: number;
@@ -32,6 +64,10 @@ type LiveStatsResponse = {
     window: Totals;
     allTime: Totals;
   };
+  feedback: FeedbackStats;
+  calibratedThreshold: number | null;
+  thresholdHistory: ThresholdHistoryPoint[];
+  scoreDistribution: ScoreDistribution | null;
 };
 
 function isRecord(x: unknown): x is Record<string, unknown> {
@@ -65,12 +101,33 @@ function isTimelinePoint(x: unknown): x is TimelinePoint {
   return isFiniteNumber(x["tsMs"]) && isFiniteNumber(x["seen"]) && isFiniteNumber(x["filtered"]) && isFiniteNumber(x["highlighted"]);
 }
 
+function isFeedbackStats(x: unknown): x is FeedbackStats {
+  if (!isRecord(x)) return false;
+  return isFiniteNumber(x["totalUp"]) && isFiniteNumber(x["totalDown"]) && isFiniteNumber(x["total"]);
+}
+
+function isThresholdHistoryPoint(x: unknown): x is ThresholdHistoryPoint {
+  if (!isRecord(x)) return false;
+  return typeof x["sessionId"] === "string" && isFiniteNumber(x["lastFeedbackAt"]) && (x["threshold"] === null || isFiniteNumber(x["threshold"]));
+}
+
+function isScoreDistribution(x: unknown): x is ScoreDistribution {
+  if (!isRecord(x)) return false;
+  const buckets = x["buckets"];
+  if (!Array.isArray(buckets)) return false;
+  return buckets.every((b) => isRecord(b) && isFiniteNumber(b["rangeStart"]) && isFiniteNumber(b["upCount"]) && isFiniteNumber(b["downCount"]));
+}
+
 function isLiveStatsResponse(x: unknown): x is LiveStatsResponse {
   if (!isRecord(x) || x["ok"] !== true) return false;
   const totals = x["totals"];
   if (!isRecord(totals) || !isTotals(totals["window"]) || !isTotals(totals["allTime"])) return false;
   const timeline = x["timeline"];
   if (!Array.isArray(timeline) || !timeline.every(isTimelinePoint)) return false;
+  if (!isFeedbackStats(x["feedback"])) return false;
+  if (x["calibratedThreshold"] !== null && !isFiniteNumber(x["calibratedThreshold"])) return false;
+  if (!Array.isArray(x["thresholdHistory"]) || !x["thresholdHistory"].every(isThresholdHistoryPoint)) return false;
+  if (x["scoreDistribution"] !== null && !isScoreDistribution(x["scoreDistribution"])) return false;
   return isFiniteNumber(x["windowHours"]) && isFiniteNumber(x["bucketMinutes"]) && isFiniteNumber(x["windowStartMs"]) && isFiniteNumber(x["windowEndMs"]);
 }
 
@@ -254,6 +311,131 @@ function DistributionPie({ totals }: { totals: Totals }) {
   );
 }
 
+function ThresholdHistoryGraph({ history }: { history: ThresholdHistoryPoint[] }) {
+  const points = history.filter((p) => p.threshold !== null) as Array<{ sessionId: string; threshold: number; lastFeedbackAt: number }>;
+  if (points.length < 2) return null;
+
+  const viewWidth = 840;
+  const viewHeight = 200;
+  const padLeft = 44;
+  const padRight = 12;
+  const padTop = 12;
+  const padBottom = 34;
+  const innerWidth = Math.max(1, viewWidth - padLeft - padRight);
+  const innerHeight = Math.max(1, viewHeight - padTop - padBottom);
+
+  const minY = 60;
+  const maxY = 95;
+  const rangeY = maxY - minY;
+
+  const polyline = points
+    .map((p, idx) => {
+      const x = points.length <= 1 ? padLeft : padLeft + (idx / (points.length - 1)) * innerWidth;
+      const y = padTop + (1 - (p.threshold - minY) / rangeY) * innerHeight;
+      return `${x},${y}`;
+    })
+    .join(" ");
+
+  const gridTicks = [60, 70, 80, 90, 95];
+  const first = points[0]!;
+  const last = points[points.length - 1]!;
+
+  return (
+    <div className="mt-3">
+      <div className="mb-1 text-xs font-medium text-zinc-200">Threshold evolution across sessions</div>
+      <svg viewBox={`0 0 ${viewWidth} ${viewHeight}`} className="h-44 w-full">
+        {gridTicks.map((tick) => {
+          const y = padTop + (1 - (tick - minY) / rangeY) * innerHeight;
+          return (
+            <g key={tick}>
+              <line x1={padLeft} y1={y} x2={padLeft + innerWidth} y2={y} stroke="rgba(255,255,255,0.08)" strokeWidth="1" />
+              <text x={padLeft - 8} y={y + 4} textAnchor="end" fill="#9ca3af" fontSize="10">
+                {tick}
+              </text>
+            </g>
+          );
+        })}
+        <polyline points={polyline} fill="none" stroke="#d6bcff" strokeWidth="2" strokeLinejoin="round" strokeLinecap="round" />
+        {points.map((p, idx) => {
+          const x = points.length <= 1 ? padLeft : padLeft + (idx / (points.length - 1)) * innerWidth;
+          const y = padTop + (1 - (p.threshold - minY) / rangeY) * innerHeight;
+          return <circle key={p.sessionId} cx={x} cy={y} r="3" fill="#d6bcff" />;
+        })}
+        <text x={padLeft} y={viewHeight - 10} textAnchor="start" fill="#9ca3af" fontSize="10">
+          {new Date(first.lastFeedbackAt).toLocaleDateString([], { month: "short", day: "numeric" })}
+        </text>
+        <text x={padLeft + innerWidth} y={viewHeight - 10} textAnchor="end" fill="#9ca3af" fontSize="10">
+          {new Date(last.lastFeedbackAt).toLocaleDateString([], { month: "short", day: "numeric" })}
+        </text>
+      </svg>
+    </div>
+  );
+}
+
+function ScoreDistributionChart({ distribution }: { distribution: ScoreDistribution }) {
+  const maxCount = Math.max(1, ...distribution.buckets.map((b) => b.upCount + b.downCount));
+  const viewWidth = 840;
+  const viewHeight = 200;
+  const padLeft = 44;
+  const padRight = 12;
+  const padTop = 12;
+  const padBottom = 34;
+  const innerWidth = Math.max(1, viewWidth - padLeft - padRight);
+  const innerHeight = Math.max(1, viewHeight - padTop - padBottom);
+  const barWidth = innerWidth / distribution.buckets.length;
+  const barGap = 4;
+
+  return (
+    <div className="mt-3">
+      <div className="mb-2 flex items-center gap-4 text-xs">
+        <span className="inline-flex items-center gap-1 text-zinc-200">
+          <span className="inline-block h-2.5 w-2.5 rounded-full bg-emerald-400" />
+          Upvoted
+        </span>
+        <span className="inline-flex items-center gap-1 text-zinc-200">
+          <span className="inline-block h-2.5 w-2.5 rounded-full bg-red-400" />
+          Downvoted
+        </span>
+      </div>
+      <svg viewBox={`0 0 ${viewWidth} ${viewHeight}`} className="h-44 w-full">
+        {[0, 0.25, 0.5, 0.75, 1].map((tick) => {
+          const y = padTop + (1 - tick) * innerHeight;
+          const value = Math.round(maxCount * tick);
+          return (
+            <g key={tick}>
+              <line x1={padLeft} y1={y} x2={padLeft + innerWidth} y2={y} stroke="rgba(255,255,255,0.08)" strokeWidth="1" />
+              <text x={padLeft - 8} y={y + 4} textAnchor="end" fill="#9ca3af" fontSize="10">
+                {value}
+              </text>
+            </g>
+          );
+        })}
+        {distribution.buckets.map((b, idx) => {
+          const total = b.upCount + b.downCount;
+          const totalHeight = (total / maxCount) * innerHeight;
+          const upHeight = (b.upCount / maxCount) * innerHeight;
+          const downHeight = (b.downCount / maxCount) * innerHeight;
+          const x = padLeft + idx * barWidth + barGap / 2;
+          const w = barWidth - barGap;
+          const barBase = padTop + innerHeight;
+
+          return (
+            <g key={b.rangeStart}>
+              {/* Green (up) portion on bottom */}
+              <rect x={x} y={barBase - totalHeight} width={w} height={upHeight} rx="2" fill="#34d399" />
+              {/* Red (down) portion on top */}
+              <rect x={x} y={barBase - totalHeight + upHeight} width={w} height={downHeight} rx="2" fill="#f87171" />
+              <text x={x + w / 2} y={viewHeight - 10} textAnchor="middle" fill="#9ca3af" fontSize="9">
+                {b.rangeStart}-{b.rangeStart + 4}
+              </text>
+            </g>
+          );
+        })}
+      </svg>
+    </div>
+  );
+}
+
 export default function Home() {
   const [liveIndicator, setLiveIndicator] = useState<LiveIndicatorState>("checking");
   const [liveSessionId, setLiveSessionId] = useState<string | null>(null);
@@ -261,6 +443,7 @@ export default function Home() {
   const [statsLoading, setStatsLoading] = useState(true);
   const [statsError, setStatsError] = useState<string | null>(null);
   const [timeRange, setTimeRange] = useState<TimeRange>("24h");
+  const [selectedScoreSession, setSelectedScoreSession] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -321,10 +504,9 @@ export default function Home() {
     const cfg = TIME_RANGE_CONFIG[timeRange];
     const refreshStats = async () => {
       try {
-        const r = await fetch(
-          `/api/home/live-stats?windowHours=${cfg.windowHours}&bucketMinutes=${cfg.bucketMinutes}`,
-          { cache: "no-store" },
-        );
+        let fetchUrl = `/api/home/live-stats?windowHours=${cfg.windowHours}&bucketMinutes=${cfg.bucketMinutes}`;
+        if (selectedScoreSession) fetchUrl += `&scoreSessionId=${encodeURIComponent(selectedScoreSession)}`;
+        const r = await fetch(fetchUrl, { cache: "no-store" });
         const j = (await r.json()) as unknown;
         if (!isLiveStatsResponse(j)) {
           const message = isRecord(j) && typeof j["error"] === "string" ? j["error"] : "Failed to load live stats.";
@@ -351,7 +533,7 @@ export default function Home() {
       cancelled = true;
       window.clearInterval(id);
     };
-  }, [timeRange]);
+  }, [timeRange, selectedScoreSession]);
 
   return (
     <div className="twitch-page">
@@ -413,7 +595,7 @@ export default function Home() {
 
           {stats ? (
             <>
-              <div className="mt-3 grid gap-3 sm:grid-cols-3">
+              <div className="mt-3 grid gap-3 sm:grid-cols-5">
                 <div className="twitch-card-soft p-3">
                   <div className="twitch-muted text-[11px]">Seen (all-time)</div>
                   <div className="mt-1 text-xl font-semibold text-blue-300">{formatCount(stats.totals.allTime.seen)}</div>
@@ -425,6 +607,40 @@ export default function Home() {
                 <div className="twitch-card-soft p-3">
                   <div className="twitch-muted text-[11px]">Highlighted (all-time)</div>
                   <div className="mt-1 text-xl font-semibold text-emerald-300">{formatCount(stats.totals.allTime.highlighted)}</div>
+                </div>
+                <div className="twitch-card-soft p-3">
+                  <div className="twitch-muted text-[11px]">AI Agreement Rate</div>
+                  <div className={`mt-1 text-xl font-semibold ${
+                    stats.feedback.agreementRate === null
+                      ? "text-zinc-500"
+                      : stats.feedback.agreementRate >= 0.7
+                        ? "text-emerald-300"
+                        : stats.feedback.agreementRate >= 0.4
+                          ? "text-amber-300"
+                          : "text-red-300"
+                  }`}>
+                    {stats.feedback.agreementRate !== null
+                      ? `${Math.round(stats.feedback.agreementRate * 100)}%`
+                      : "--"}
+                  </div>
+                  <div className="twitch-muted mt-0.5 text-[10px]">
+                    {stats.feedback.total > 0
+                      ? `${stats.feedback.totalUp} up / ${stats.feedback.totalDown} down`
+                      : "No feedback yet"}
+                  </div>
+                </div>
+                <div className="twitch-card-soft p-3">
+                  <div className="twitch-muted text-[11px]">Suggested Threshold</div>
+                  <div className={`mt-1 text-xl font-semibold ${
+                    stats.calibratedThreshold !== null ? "text-[#d6bcff]" : "text-zinc-500"
+                  }`}>
+                    {stats.calibratedThreshold !== null ? stats.calibratedThreshold : "--"}
+                  </div>
+                  <div className="twitch-muted mt-0.5 text-[10px]">
+                    {stats.calibratedThreshold !== null
+                      ? "Auto-calibrated from feedback"
+                      : "Not enough data"}
+                  </div>
                 </div>
               </div>
 
@@ -457,6 +673,48 @@ export default function Home() {
                   <DistributionPie totals={stats.totals.allTime} />
                 </div>
               </div>
+
+              {stats.feedback.recentSessions.length > 0 ? (
+                <div className="mt-4 twitch-card-soft p-3">
+                  <div className="mb-2 text-xs font-medium text-zinc-200">Feedback by session</div>
+                  <div className="space-y-1.5">
+                    {stats.feedback.recentSessions.map((s) => {
+                      const pct = Math.round(s.rate * 100);
+                      const isSelected = selectedScoreSession === s.sessionId;
+                      return (
+                        <button
+                          key={s.sessionId}
+                          onClick={() => setSelectedScoreSession(isSelected ? null : s.sessionId)}
+                          className={`flex w-full items-center gap-3 rounded px-1 py-0.5 text-xs transition-colors text-left ${
+                            isSelected ? "bg-[#9147ff]/10 ring-1 ring-[#9147ff]/40" : "hover:bg-[#1f1f23]"
+                          }`}
+                        >
+                          <div className="w-24 truncate twitch-muted" title={s.sessionId}>
+                            {new Date(s.lastFeedbackAt).toLocaleDateString([], { month: "short", day: "numeric" })}
+                          </div>
+                          <div className="flex-1">
+                            <div className="h-2 overflow-hidden rounded-full bg-[#1f1f23]">
+                              <div
+                                className={`h-full rounded-full ${
+                                  pct >= 70 ? "bg-emerald-400" : pct >= 40 ? "bg-amber-400" : "bg-red-400"
+                                }`}
+                                style={{ width: `${pct}%` }}
+                              />
+                            </div>
+                          </div>
+                          <div className="w-16 text-right text-zinc-300">
+                            {pct}% ({s.up + s.down})
+                          </div>
+                        </button>
+                      );
+                    })}
+                  </div>
+                  {stats.scoreDistribution ? (
+                    <ScoreDistributionChart distribution={stats.scoreDistribution} />
+                  ) : null}
+                  <ThresholdHistoryGraph history={stats.thresholdHistory} />
+                </div>
+              ) : null}
             </>
           ) : statsLoading ? (
             <div className="mt-2 text-xs twitch-muted">Loading analytics...</div>

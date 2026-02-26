@@ -48,12 +48,36 @@ export default function LiveHighlightsPage() {
   const [goodMessages, setGoodMessages] = useState<LiveFeedMessage[]>([]);
   const [errorText, setErrorText] = useState<string | null>(null);
   const [hasRestoredSnapshot, setHasRestoredSnapshot] = useState(false);
-  const [feedbackState, setFeedbackState] = useState<Map<string, "up" | "down">>(new Map());
+  const [feedbackState, setFeedbackState] = useState<Map<string, "up" | "down">>(() => {
+    const snap = loadLiveSnapshot();
+    return snap ? new Map(Object.entries(snap.feedbackGiven)) : new Map();
+  });
+  const [pendingKey, setPendingKey] = useState<string | null>(null);
+  const [selectedIndex, setSelectedIndex] = useState<number | null>(null);
 
   const submitFeedback = useCallback(
     async (msg: LiveFeedMessage, idx: number, direction: "up" | "down") => {
       const key = `${msg.ts_ms}-${idx}`;
-      setFeedbackState((prev) => new Map(prev).set(key, direction));
+      const existing = feedbackState.get(key);
+
+      // Undo: clicking same direction again removes the vote (no API call)
+      if (existing === direction) {
+        setFeedbackState((prev) => {
+          const next = new Map(prev);
+          next.delete(key);
+          saveLiveSnapshotPatch({ feedbackGiven: Object.fromEntries(next) });
+          return next;
+        });
+        return;
+      }
+
+      // Set new direction optimistically
+      setPendingKey(key);
+      setFeedbackState((prev) => {
+        const next = new Map(prev).set(key, direction);
+        saveLiveSnapshotPatch({ feedbackGiven: Object.fromEntries(next) });
+        return next;
+      });
       try {
         const res = await fetch("/api/live/feedback", {
           method: "POST",
@@ -76,6 +100,7 @@ export default function LiveHighlightsPage() {
           setFeedbackState((prev) => {
             const next = new Map(prev);
             next.delete(key);
+            saveLiveSnapshotPatch({ feedbackGiven: Object.fromEntries(next) });
             return next;
           });
         }
@@ -83,11 +108,14 @@ export default function LiveHighlightsPage() {
         setFeedbackState((prev) => {
           const next = new Map(prev);
           next.delete(key);
+          saveLiveSnapshotPatch({ feedbackGiven: Object.fromEntries(next) });
           return next;
         });
+      } finally {
+        setPendingKey(null);
       }
     },
-    [sessionId],
+    [sessionId, feedbackState],
   );
   const chatRef = useRef<HTMLDivElement | null>(null);
   const pollRef = useRef<(sid: string) => Promise<void>>(async () => {});
@@ -160,6 +188,45 @@ export default function LiveHighlightsPage() {
     chatRef.current.scrollTop = chatRef.current.scrollHeight;
   }, [goodMessages]);
 
+  // Keyboard shortcuts
+  useEffect(() => {
+    const handler = (e: KeyboardEvent) => {
+      const tag = (e.target as HTMLElement)?.tagName;
+      if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
+      if (goodMessages.length === 0) return;
+
+      if (e.key === "j" || e.key === "ArrowDown") {
+        e.preventDefault();
+        setSelectedIndex((prev) => {
+          const next = prev === null ? 0 : Math.min(prev + 1, goodMessages.length - 1);
+          const el = chatRef.current?.querySelector(`[data-index="${next}"]`);
+          el?.scrollIntoView({ block: "nearest" });
+          return next;
+        });
+      } else if (e.key === "k" || e.key === "ArrowUp") {
+        e.preventDefault();
+        setSelectedIndex((prev) => {
+          const next = prev === null ? 0 : Math.max(prev - 1, 0);
+          const el = chatRef.current?.querySelector(`[data-index="${next}"]`);
+          el?.scrollIntoView({ block: "nearest" });
+          return next;
+        });
+      } else if (e.key === "u" && selectedIndex !== null) {
+        e.preventDefault();
+        const msg = goodMessages[selectedIndex];
+        if (msg) void submitFeedback(msg, selectedIndex, "up");
+      } else if (e.key === "d" && selectedIndex !== null) {
+        e.preventDefault();
+        const msg = goodMessages[selectedIndex];
+        if (msg) void submitFeedback(msg, selectedIndex, "down");
+      } else if (e.key === "Escape") {
+        setSelectedIndex(null);
+      }
+    };
+    window.addEventListener("keydown", handler);
+    return () => window.removeEventListener("keydown", handler);
+  }, [goodMessages, selectedIndex, submitFeedback]);
+
   return (
     <div className="twitch-page">
       <div className="twitch-shell max-w-4xl">
@@ -187,6 +254,9 @@ export default function LiveHighlightsPage() {
             ref={chatRef}
             className="max-h-[72vh] overflow-auto bg-[#0b0b10] px-2 py-2"
           >
+            {goodMessages.length > 0 ? (
+              <div className="mb-1 px-2 text-[11px] text-zinc-600">j/k navigate &middot; u/d vote</div>
+            ) : null}
             {goodMessages.length === 0 ? (
               <div className="p-3 text-sm text-zinc-400">
                 {sessionId ? "(No highlighted chat yet)" : "Start a live session first, then open this page."}
@@ -196,8 +266,17 @@ export default function LiveHighlightsPage() {
                 {goodMessages.map((m, idx) => {
                   const fbKey = `${m.ts_ms}-${idx}`;
                   const fb = feedbackState.get(fbKey);
+                  const isSelected = selectedIndex === idx;
+                  const isPending = pendingKey === fbKey;
                   return (
-                    <div key={fbKey} className="group flex items-center px-2 py-1 text-[14px] leading-6">
+                    <div
+                      key={fbKey}
+                      data-index={idx}
+                      onClick={() => setSelectedIndex(idx)}
+                      className={`group flex items-center px-2 py-1 text-[14px] leading-6 cursor-pointer ${
+                        isSelected ? "border-l-2 border-[#9147ff] bg-[#9147ff]/5" : "border-l-2 border-transparent"
+                      }`}
+                    >
                       <div className="flex-1 min-w-0">
                         <span className="mr-2 text-[11px] text-zinc-500">{formatTime(m.ts_ms)}</span>
                         <span className="mr-2 font-semibold" style={{ color: colorForName(m.username) }}>
@@ -208,20 +287,20 @@ export default function LiveHighlightsPage() {
                           <span className="ml-2 text-[11px] text-zinc-500">({Math.round(m.score)})</span>
                         ) : null}
                       </div>
-                      <div className={`ml-2 flex gap-1 shrink-0 ${fb ? "opacity-100" : "opacity-0 group-hover:opacity-100"} transition-opacity`}>
+                      <div className={`ml-2 flex gap-1 shrink-0 ${fb || isSelected ? "opacity-100" : "opacity-0 group-hover:opacity-100"} transition-opacity`}>
                         <button
-                          disabled={!!fb}
-                          onClick={() => void submitFeedback(m, idx, "up")}
+                          disabled={isPending && fb !== "up"}
+                          onClick={(e) => { e.stopPropagation(); void submitFeedback(m, idx, "up"); }}
                           className={`px-1.5 py-0.5 rounded text-sm ${fb === "up" ? "text-emerald-400" : "text-zinc-500 hover:text-emerald-400"} disabled:cursor-default`}
-                          title="Good pick"
+                          title={fb === "up" ? "Undo upvote" : "Good pick"}
                         >
                           {"\u25B2"}
                         </button>
                         <button
-                          disabled={!!fb}
-                          onClick={() => void submitFeedback(m, idx, "down")}
+                          disabled={isPending && fb !== "down"}
+                          onClick={(e) => { e.stopPropagation(); void submitFeedback(m, idx, "down"); }}
                           className={`px-1.5 py-0.5 rounded text-sm ${fb === "down" ? "text-red-400" : "text-zinc-500 hover:text-red-400"} disabled:cursor-default`}
-                          title="Bad pick"
+                          title={fb === "down" ? "Undo downvote" : "Bad pick"}
                         >
                           {"\u25BC"}
                         </button>

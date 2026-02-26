@@ -22,6 +22,8 @@ export default function LivePage() {
   const [dynamicThreshold, setDynamicThreshold] = useState(false);
   const [targetRate, setTargetRate] = useState(2);
 
+  const [calibratedThreshold, setCalibratedThreshold] = useState<number | null>(null);
+
   const [sessionId, setSessionId] = useState<string | null>(null);
   const [status, setStatus] = useState<LiveStatus | null>(null);
   const [isRunning, setIsRunning] = useState(false);
@@ -56,6 +58,28 @@ export default function LivePage() {
         }
       } catch {
         // ignore
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Fetch calibrated threshold on mount and pre-populate the slider
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const r = await fetch("/api/home/live-stats?windowHours=24&bucketMinutes=60", { cache: "no-store" });
+        const j = (await r.json()) as unknown;
+        if (cancelled || !isRecord(j) || j["ok"] !== true) return;
+        const ct = j["calibratedThreshold"];
+        if (typeof ct === "number" && Number.isFinite(ct)) {
+          setCalibratedThreshold(ct);
+          setThreshold(ct);
+        }
+      } catch {
+        // ignore — fall back to default
       }
     })();
     return () => {
@@ -208,7 +232,14 @@ export default function LivePage() {
             <div>
               <div className="flex items-center justify-between">
                 <label className="twitch-muted text-xs font-medium">Highlight threshold</label>
-                <span className="twitch-muted text-xs">{threshold}</span>
+                <div className="flex items-center gap-2">
+                  {isRunning ? (
+                    <span className="text-[10px] text-zinc-500">Locked for current session</span>
+                  ) : calibratedThreshold !== null && threshold === calibratedThreshold ? (
+                    <span className="text-[10px] text-[#d6bcff]">Auto-calibrated from feedback</span>
+                  ) : null}
+                  <span className="twitch-muted text-xs">{threshold}</span>
+                </div>
               </div>
               <div className="mt-1 flex h-10 items-center">
                 <input
@@ -217,10 +248,10 @@ export default function LivePage() {
                   min={0}
                   max={100}
                   step={1}
-                  disabled={dynamicThreshold}
+                  disabled={dynamicThreshold || isRunning}
                   onChange={(e) => setThreshold(Math.max(0, Math.min(100, Number(e.target.value || "80"))))}
                   style={thresholdSliderStyle}
-                  className={`twitch-slider${dynamicThreshold ? " opacity-40 cursor-not-allowed" : ""}`}
+                  className={`twitch-slider${dynamicThreshold || isRunning ? " opacity-40 cursor-not-allowed" : ""}`}
                 />
               </div>
             </div>
@@ -228,11 +259,14 @@ export default function LivePage() {
               <div className="flex h-10 items-center gap-2">
               <button
                 type="button"
+                disabled={isRunning}
                 onClick={() => setDynamicThreshold((v) => !v)}
                 className={`rounded-full border px-3 py-1 text-xs font-medium whitespace-nowrap transition-colors ${
-                  dynamicThreshold
-                    ? "border-emerald-400/40 bg-emerald-500/10 text-emerald-300"
-                    : "border-[var(--border)] bg-[#121217] text-zinc-400"
+                  isRunning
+                    ? "opacity-40 cursor-not-allowed border-[var(--border)] bg-[#121217] text-zinc-400"
+                    : dynamicThreshold
+                      ? "border-emerald-400/40 bg-emerald-500/10 text-emerald-300"
+                      : "border-[var(--border)] bg-[#121217] text-zinc-400"
                 }`}
               >
                 {dynamicThreshold ? "Dynamic on" : "Dynamic off"}
@@ -245,8 +279,9 @@ export default function LivePage() {
                     min={0.5}
                     max={30}
                     step={0.5}
+                    disabled={isRunning}
                     onChange={(e) => setTargetRate(Math.max(0.5, Math.min(30, Number(e.target.value) || 2)))}
-                    className="twitch-input w-14 text-center text-xs"
+                    className={`twitch-input w-14 text-center text-xs${isRunning ? " opacity-40 cursor-not-allowed" : ""}`}
                   />
                   <span className="twitch-muted text-xs whitespace-nowrap">msg/min</span>
                 </div>

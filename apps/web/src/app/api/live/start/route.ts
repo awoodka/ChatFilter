@@ -3,6 +3,7 @@ import { NextResponse } from "next/server";
 import { JobStatus, writeJobStatus } from "@/lib/job";
 import { startLiveSession } from "@/lib/server/liveSession";
 import { requireAuthUser } from "@/lib/server/routeAuth";
+import { computeCalibratedThreshold } from "@/lib/server/userFeedback";
 import { getOrCreateUserProfile } from "@/lib/server/userProfile";
 
 export const runtime = "nodejs";
@@ -29,7 +30,7 @@ export async function POST(req: Request) {
     return jsonError("Invalid JSON body");
   }
   const currentGame = String(body.currentGame ?? "").trim();
-  const threshold = Number(body.thresholdScoreExclusive ?? 80);
+  const threshold = Number(body.thresholdScoreExclusive ?? computeCalibratedThreshold(auth.user.id) ?? 80);
 
   const sessionId = `live_${Date.now()}_${Math.random().toString(16).slice(2)}`;
   const createdAt = Date.now();

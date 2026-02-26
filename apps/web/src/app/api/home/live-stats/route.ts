@@ -2,6 +2,12 @@ import { NextResponse } from "next/server";
 
 import { readUserLiveMetricStats } from "@/lib/server/liveUserStats";
 import { requireAuthUser } from "@/lib/server/routeAuth";
+import {
+  computeCalibratedThreshold,
+  getSessionScoreDistribution,
+  getThresholdHistory,
+  getUserFeedbackAgreementStats,
+} from "@/lib/server/userFeedback";
 
 export const runtime = "nodejs";
 
@@ -24,5 +30,14 @@ export async function GET(req: Request) {
     windowHours,
     bucketMinutes,
   });
-  return NextResponse.json({ ok: true, ...stats });
+  const feedback = getUserFeedbackAgreementStats(auth.user.id);
+  const calibratedThreshold = computeCalibratedThreshold(auth.user.id);
+  const thresholdHistory = getThresholdHistory(auth.user.id);
+
+  const scoreSessionId = url.searchParams.get("scoreSessionId");
+  const scoreDistribution = scoreSessionId
+    ? getSessionScoreDistribution(auth.user.id, scoreSessionId)
+    : null;
+
+  return NextResponse.json({ ok: true, ...stats, feedback, calibratedThreshold, thresholdHistory, scoreDistribution });
 }

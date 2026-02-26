@@ -33,6 +33,7 @@ export type LiveSessionSnapshot = {
   dynamicThreshold: boolean;
   targetRate: number;
   linkedChannelUrl: string;
+  feedbackGiven: Record<string, "up" | "down">;
   updatedAt: number;
 };
 
@@ -88,6 +89,7 @@ function defaultSnapshot(): LiveSessionSnapshot {
     dynamicThreshold: false,
     targetRate: 2,
     linkedChannelUrl: "",
+    feedbackGiven: {},
     updatedAt: Date.now(),
   };
 }
@@ -128,6 +130,14 @@ export function loadLiveSnapshot(): LiveSessionSnapshot | null {
           ? Math.max(0.5, Math.min(30, parsed["targetRate"]))
           : base.targetRate,
       linkedChannelUrl: typeof parsed["linkedChannelUrl"] === "string" ? parsed["linkedChannelUrl"] : "",
+      feedbackGiven:
+        isRecord(parsed["feedbackGiven"])
+          ? Object.fromEntries(
+              Object.entries(parsed["feedbackGiven"] as Record<string, unknown>).filter(
+                ([, v]) => v === "up" || v === "down",
+              ),
+            ) as Record<string, "up" | "down">
+          : {},
       updatedAt: typeof parsed["updatedAt"] === "number" ? parsed["updatedAt"] : Date.now(),
     };
   } catch {
