@@ -883,7 +883,7 @@ export default function Home() {
           ) : statsLoading ? (
             <div className="mt-2 text-xs twitch-muted">Loading analytics...</div>
           ) : (
-            <div className="mt-2 text-xs twitch-muted">No live analytics yet. Start Live MVP to begin tracking.</div>
+            <div className="mt-2 text-xs twitch-muted">No live analytics yet. Start Filter to begin tracking.</div>
           )}
         </div>
 

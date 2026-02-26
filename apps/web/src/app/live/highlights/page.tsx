@@ -330,7 +330,7 @@ export default function LiveHighlightsPage() {
             className="twitch-button-secondary inline-flex !h-8 items-center !text-xs"
             href={sessionId ? `/live?sessionId=${encodeURIComponent(sessionId)}` : "/live"}
           >
-            Back to Live MVP
+            Back to Filter
           </Link>
         </div>
 

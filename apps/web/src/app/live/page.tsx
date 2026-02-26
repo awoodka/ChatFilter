@@ -15,6 +15,20 @@ function isRecord(x: unknown): x is Record<string, unknown> {
   return typeof x === "object" && x !== null;
 }
 
+const TWITCH_NAME_COLORS = [
+  "#FF0000", "#0000FF", "#00FF00", "#B22222", "#FF7F50",
+  "#9ACD32", "#FF4500", "#2E8B57", "#DAA520", "#D2691E",
+  "#5F9EA0", "#1E90FF", "#FF69B4", "#8A2BE2", "#00FF7F",
+];
+
+function usernameColor(name: string): string {
+  let hash = 0;
+  for (let i = 0; i < name.length; i++) {
+    hash = name.charCodeAt(i) + ((hash << 5) - hash);
+  }
+  return TWITCH_NAME_COLORS[Math.abs(hash) % TWITCH_NAME_COLORS.length]!;
+}
+
 export default function LivePage() {
   const searchParams = useSearchParams();
   const [linkedChannelUrl, setLinkedChannelUrl] = useState("");
@@ -33,6 +47,7 @@ export default function LivePage() {
   const [errorText, setErrorText] = useState<string | null>(null);
   const [metricsText, setMetricsText] = useState<string>("{ }");
   const [contextText, setContextText] = useState<string>("{ }");
+  const [showDebug, setShowDebug] = useState(false);
   const [hasRestoredSnapshot, setHasRestoredSnapshot] = useState(false);
   const thresholdTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const goodChatRef = useRef<HTMLDivElement | null>(null);
@@ -219,7 +234,7 @@ export default function LivePage() {
     <div className="twitch-page">
       <div className="twitch-shell">
         <div className="flex items-baseline justify-between gap-4">
-          <h1 className="text-2xl font-semibold tracking-tight">Live MVP</h1>
+          <h1 className="text-2xl font-semibold tracking-tight">Filter</h1>
           <div className="flex items-center gap-3">
             <Link className="twitch-link text-sm" href="/">
               Back
@@ -389,79 +404,109 @@ export default function LivePage() {
         </div>
 
         <div className="mt-6 grid gap-4 lg:grid-cols-2">
-          <div className="twitch-card p-4">
-            <h3 className="text-sm font-medium">Good chats (score above threshold)</h3>
-            <div ref={goodChatRef} className="twitch-scroll mt-2 max-h-[420px] overflow-auto p-2 text-sm">
+          {/* Highlighted chat */}
+          <div className="flex flex-col overflow-hidden rounded-lg border border-[var(--border)]">
+            <div className="flex items-center justify-between border-b border-[var(--border)] bg-[#18181b] px-4 py-2">
+              <span className="text-sm font-semibold">Highlighted Chat</span>
+              <span className="text-xs text-[#adadb8]">{goodMessages.length} messages</span>
+            </div>
+            <div ref={goodChatRef} className="flex-1 overflow-auto bg-[#0e0e10] px-4 py-2" style={{ maxHeight: 480, minHeight: 320 }}>
               {goodMessages.length === 0 ? (
-                <div className="twitch-muted text-xs">(none yet)</div>
+                <div className="flex h-full items-center justify-center text-xs text-[#adadb8]">
+                  Waiting for highlighted messages...
+                </div>
               ) : (
-                <div className="space-y-2">
-                  {goodMessages.map((m, idx) => (
-                    <div key={`${m.ts_ms}-${idx}`} className="twitch-card-soft p-2 text-sm">
-                      <div className="twitch-muted text-xs">
-                        <span className="font-medium text-zinc-100">{m.username ?? "unknown"}</span>
-                        <span className="ml-2">ts_ms={m.ts_ms}</span>
+                <div className="space-y-1">
+                  {goodMessages.map((m, idx) => {
+                    const name = m.username ?? "unknown";
+                    return (
+                      <div key={`${m.ts_ms}-${idx}`} className="leading-6 hover:bg-[#1f1f23]/60">
                         {typeof m.score === "number" ? (
-                          <span className="ml-2">
-                            R:{Math.round(m.relevance ?? 0)} H:{Math.round(m.humor ?? 0)} E:{Math.round(m.engagement ?? 0)} |{" "}
+                          <span className="mr-1.5 inline-block rounded bg-[#9147ff]/20 px-1 py-px align-middle text-[10px] font-medium text-[#bf94ff]">
                             {Math.round(m.score)}
                           </span>
                         ) : null}
+                        <span className="text-[13px] font-bold" style={{ color: usernameColor(name) }}>
+                          {name}
+                        </span>
+                        <span className="text-[#efeff1]">: </span>
+                        <span className="text-[13px] text-[#efeff1]">{m.text}</span>
                       </div>
-                      <div className="mt-1 whitespace-pre-wrap">{m.text}</div>
-                      {m.reason ? <div className="twitch-muted mt-1 text-xs">{m.reason}</div> : null}
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
             </div>
           </div>
 
-          <div className="twitch-card p-4">
-            <h3 className="text-sm font-medium">Incoming live chat (filtered)</h3>
-            <div ref={incomingChatRef} className="twitch-scroll mt-2 max-h-[420px] overflow-auto p-2 text-sm">
+          {/* All chat */}
+          <div className="flex flex-col overflow-hidden rounded-lg border border-[var(--border)]">
+            <div className="flex items-center justify-between border-b border-[var(--border)] bg-[#18181b] px-4 py-2">
+              <span className="text-sm font-semibold">All Chat</span>
+              <span className="text-xs text-[#adadb8]">{chatMessages.length} messages</span>
+            </div>
+            <div ref={incomingChatRef} className="flex-1 overflow-auto bg-[#0e0e10] px-4 py-2" style={{ maxHeight: 480, minHeight: 320 }}>
               {chatMessages.length === 0 ? (
-                <div className="twitch-muted text-xs">(none yet)</div>
+                <div className="flex h-full items-center justify-center text-xs text-[#adadb8]">
+                  Waiting for chat messages...
+                </div>
               ) : (
-                <div className="space-y-2">
-                  {chatMessages.map((m, idx) => (
-                    <div key={`${m.ts_ms}-${idx}`} className="twitch-card-soft p-2 text-sm">
-                      <div className="twitch-muted text-xs">
-                        <span className="font-medium text-zinc-100">{m.username ?? "unknown"}</span>
-                        <span className="ml-2">ts_ms={m.ts_ms}</span>
+                <div className="space-y-1">
+                  {chatMessages.map((m, idx) => {
+                    const name = m.username ?? "unknown";
+                    return (
+                      <div key={`${m.ts_ms}-${idx}`} className="leading-6 hover:bg-[#1f1f23]/60">
+                        <span className="text-[13px] font-bold" style={{ color: usernameColor(name) }}>
+                          {name}
+                        </span>
+                        <span className="text-[#efeff1]">: </span>
+                        <span className="text-[13px] text-[#efeff1]">{m.text}</span>
                       </div>
-                      <div className="mt-1 whitespace-pre-wrap">{m.text}</div>
-                    </div>
-                  ))}
+                    );
+                  })}
                 </div>
               )}
             </div>
           </div>
         </div>
 
-        <div className="twitch-card mt-6 p-5">
-          <h2 className="text-base font-medium">Live metrics</h2>
-          <pre className="twitch-scroll mt-3 max-h-[220px] overflow-auto p-3 text-xs">
-            {metricsText}
-          </pre>
-        </div>
-
-        <div className="twitch-card mt-6 p-5">
-          <h2 className="text-base font-medium">Live context (debug)</h2>
-          <pre className="twitch-scroll mt-3 max-h-[220px] overflow-auto p-3 text-xs">
-            {contextText}
-          </pre>
-        </div>
-
-        <div className="twitch-card mt-6 p-5">
-          <h2 className="text-base font-medium">Logs</h2>
-          <pre
-            ref={logsRef}
-            className="twitch-scroll mt-3 max-h-[420px] overflow-auto p-3 text-xs"
+        <div className="mt-6 flex justify-center">
+          <button
+            type="button"
+            className="twitch-button-secondary text-xs"
+            onClick={() => setShowDebug((v) => !v)}
           >
-            {logText}
-          </pre>
+            {showDebug ? "Hide debug" : "Show debug"}
+          </button>
         </div>
+
+        {showDebug && (
+          <>
+            <div className="twitch-card mt-4 p-5">
+              <h2 className="text-base font-medium">Live metrics</h2>
+              <pre className="twitch-scroll mt-3 max-h-[220px] overflow-auto p-3 text-xs">
+                {metricsText}
+              </pre>
+            </div>
+
+            <div className="twitch-card mt-4 p-5">
+              <h2 className="text-base font-medium">Live context</h2>
+              <pre className="twitch-scroll mt-3 max-h-[220px] overflow-auto p-3 text-xs">
+                {contextText}
+              </pre>
+            </div>
+
+            <div className="twitch-card mt-4 p-5">
+              <h2 className="text-base font-medium">Logs</h2>
+              <pre
+                ref={logsRef}
+                className="twitch-scroll mt-3 max-h-[420px] overflow-auto p-3 text-xs"
+              >
+                {logText}
+              </pre>
+            </div>
+          </>
+        )}
       </div>
     </div>
   );

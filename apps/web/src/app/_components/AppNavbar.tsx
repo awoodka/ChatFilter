@@ -40,7 +40,7 @@ export default function AppNavbar() {
         </div>
         <div className="flex items-center gap-2">
           <Link href="/live" className="twitch-button-secondary inline-flex !h-8 items-center !text-xs">
-            Live MVP
+            Filter
           </Link>
           <Link href="/sessions" className="twitch-button-secondary inline-flex !h-8 items-center !text-xs">
             Sessions

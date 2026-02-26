@@ -95,7 +95,7 @@ export default function SettingsProfilePage() {
     <div className="twitch-card p-5">
       <h2 className="text-base font-medium">Twitch account link</h2>
       <p className="twitch-muted mt-1 text-sm">
-        Link your Twitch page to auto-populate the channel field on the Live MVP page.
+        Link your Twitch page to auto-populate the channel field on the Filter page.
       </p>
       <form
         className="mt-4 flex flex-col gap-3"
@@ -120,7 +120,7 @@ export default function SettingsProfilePage() {
             {isSaving ? "Saving..." : "Save settings"}
           </button>
           <Link className="twitch-link text-sm" href="/live">
-            Open Live MVP
+            Open Filter
           </Link>
         </div>
       </form>

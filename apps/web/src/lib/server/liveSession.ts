@@ -552,8 +552,8 @@ function isAbortError(err: unknown): boolean {
 async function captureFramesFromHls(
   hlsUrl: string,
   ffmpegBin: string,
-  frameCount: number = 6,
-  timeoutMs: number = 30_000,
+  frameCount: number = 12,
+  timeoutMs: number = 60_000,
 ): Promise<{ frames: Buffer[]; stderr: string; timedOut: boolean; exitCode: number | null }> {
   return new Promise((resolve) => {
     const args = [
@@ -561,7 +561,7 @@ async function captureFramesFromHls(
       "-loglevel", "error",
       "-i", hlsUrl,
       "-frames:v", String(frameCount),
-      "-vf", "fps=1/10,scale=1280:-1",
+      "-vf", "fps=1/4,scale=1280:-1",
       "-f", "image2pipe",
       "-vcodec", "mjpeg",
       "pipe:1",
@@ -1317,7 +1317,7 @@ export async function startLiveSession(req: LiveStartRequest): Promise<void> {
   // Video analysis loop (Gemini vision — optional, non-fatal)
   const geminiApiKey = String(process.env.GEMINI_API_KEY ?? "").trim();
   const visionIntervalMs = Math.max(10_000, Number(process.env.LIVE_VISION_INTERVAL_MS ?? 60_000));
-  const visionFrameCount = Math.max(1, Math.min(10, Number(process.env.LIVE_VISION_FRAME_COUNT ?? 6)));
+  const visionFrameCount = Math.max(1, Math.min(20, Number(process.env.LIVE_VISION_FRAME_COUNT ?? 12)));
 
   async function videoAnalysisLoop() {
     if (!geminiApiKey) return;

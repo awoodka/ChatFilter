@@ -6,7 +6,10 @@ function truncatePromptLine(s: string, n: number): string {
 export function deriveVibeFromLongTerm(text: string): string | undefined {
   const raw = String(text ?? "").trim();
   if (!raw) return undefined;
-  const firstLine = raw.split("\n").map((x) => x.trim()).find(Boolean) ?? "";
+  const firstLine = raw
+    .split("\n")
+    .map((x) => x.trim())
+    .find((line) => line && !/^[\s*#_\->=]+$/.test(line) && !/^\*\*[^*]+\*\*$/.test(line) && !/^#{1,6}\s/.test(line)) ?? "";
   if (!firstLine) return undefined;
   return truncatePromptLine(firstLine, 180);
 }

@@ -37,7 +37,7 @@ export async function POST(req: Request) {
   const profile = getOrCreateUserProfile(auth.user.id);
   const channelOrUrl = String(profile.twitchChannelUrl ?? "").trim();
   if (!channelOrUrl) {
-    return jsonError("Set your Twitch channel in Settings > Profile before starting Live MVP.");
+    return jsonError("Set your Twitch channel in Settings > Profile before starting Filter.");
   }
   const status: JobStatus = {
     jobId: sessionId,
