@@ -6,6 +6,10 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []
 
+[project.optional-dependencies]
+# Local transcription for live sessions (LIVE_TRANSCRIBE_PROVIDER=local, the default).
+whisper = ["faster-whisper"]
+
 [project.scripts]
 chatfilter = "chatfilter.cli:main"
 

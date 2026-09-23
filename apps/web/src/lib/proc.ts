@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
 
 export type ProcResult = {
   code: number;
@@ -48,3 +49,9 @@ export async function runCommandStreaming(
   });
 }
 
+// Pick the binary to run: an explicit override, then the bundled copy under tools/, then the bare name on PATH.
+export function resolveTool(override: string | undefined, bundledPath: string, name: string): string {
+  const explicit = String(override ?? "").trim();
+  if (explicit) return explicit;
+  return existsSync(bundledPath) ? bundledPath : name;
+}

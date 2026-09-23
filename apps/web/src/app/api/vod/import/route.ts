@@ -3,7 +3,7 @@ import path from "node:path";
 import { NextResponse } from "next/server";
 
 import { appendJobLog, JobStatus, writeJobStatus } from "@/lib/job";
-import { runCommandStreaming } from "@/lib/proc";
+import { resolveTool, runCommandStreaming } from "@/lib/proc";
 import { extractVodId, vodCanonicalDir, vodRawDir, vodRunsDir } from "@/lib/vod";
 import { requireAuthUser } from "@/lib/server/routeAuth";
 import { getOrCreateUserProfile } from "@/lib/server/userProfile";
@@ -26,15 +26,6 @@ function tsLine(line: string) {
   return `[${new Date().toISOString()}] ${line}\n`;
 }
 
-async function fileExists(p: string): Promise<boolean> {
-  try {
-    await fs.access(p);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 async function listFiles(dir: string): Promise<string[]> {
   try {
     return await fs.readdir(dir);
@@ -45,14 +36,13 @@ async function listFiles(dir: string): Promise<string[]> {
 
 async function splitAudioForTranscription(opts: {
   jobId: string;
-  ffmpegDir: string;
+  ffmpegPath: string;
   inputAudioPath: string;
   outDir: string;
   segmentSeconds: number;
   onLog: (line: string) => Promise<void>;
 }) {
-  const { ffmpegDir, inputAudioPath, outDir, segmentSeconds, onLog } = opts;
-  const ffmpegPath = path.join(ffmpegDir, "ffmpeg");
+  const { ffmpegPath, inputAudioPath, outDir, segmentSeconds, onLog } = opts;
 
   await fs.mkdir(outDir, { recursive: true });
   const outTemplate = path.join(outDir, "seg_%04d.mp3");
@@ -134,8 +124,8 @@ async function runImportJob(jobId: string, body: ImportRequest, user: { id: stri
   const tdLocal = path.join(repoRoot, "tools", "TwitchDownloaderCLI");
   const ytdlpLocal = path.join(repoRoot, "tools", "yt-dlp");
   const ffmpegDir = path.join(repoRoot, "tools", "ffmpeg");
-  const td = body.twitchDownloaderPath ?? process.env.TWITCHDOWNLOADER_PATH ?? tdLocal ?? "TwitchDownloaderCLI";
-  const ytdlp = body.ytDlpPath ?? process.env.YTDLP_PATH ?? ytdlpLocal ?? "yt-dlp";
+  const td = resolveTool(body.twitchDownloaderPath ?? process.env.TWITCHDOWNLOADER_PATH, tdLocal, "TwitchDownloaderCLI");
+  const ytdlp = resolveTool(body.ytDlpPath ?? process.env.YTDLP_PATH, ytdlpLocal, "yt-dlp");
   const profile = getOrCreateUserProfile(user.id);
   const knownEmotes = profile.emotes.filter((x) => x.trim()).slice(0, 200);
 
@@ -231,21 +221,15 @@ async function runImportJob(jobId: string, body: ImportRequest, user: { id: stri
   await logLine(`transcribe model=${transcribeModel}`);
 
   // Chunked transcription: re-encode + split audio to avoid huge uploads and encoding issues.
-  const ffmpegOk =
-    (await fileExists(path.join(ffmpegDir, "ffmpeg"))) && (await fileExists(path.join(ffmpegDir, "ffprobe")));
-  if (!ffmpegOk) {
-    job = { ...job, state: "failed", updatedAt: Date.now(), error: `ffmpeg/ffprobe missing at ${ffmpegDir}` };
-    await writeJobStatus(job);
-    await logLine(`error: ${job.error}`);
-    return;
-  }
+  const ffmpegPath = resolveTool(process.env.FFMPEG_PATH, path.join(ffmpegDir, "ffmpeg"), "ffmpeg");
+  await logLine(`ffmpeg=${ffmpegPath}`);
 
   const segmentsDir = path.join(rawJobDir, "transcribe_segments");
   let segmentPaths: string[] = [];
   try {
     segmentPaths = await splitAudioForTranscription({
       jobId,
-      ffmpegDir,
+      ffmpegPath,
       inputAudioPath: audioPath,
       outDir: segmentsDir,
       segmentSeconds: 600,
